@@ -14,6 +14,18 @@
 
 package org.hyperledger.fabric.sdk;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.hyperledger.fabric.protos.peer.Query.ChaincodeInfo;
+import org.hyperledger.fabric.sdk.exception.CryptoException;
+import org.hyperledger.fabric.sdk.exception.InvalidArgumentException;
+import org.hyperledger.fabric.sdk.exception.NetworkConfigurationException;
+import org.hyperledger.fabric.sdk.exception.ProposalException;
+import org.hyperledger.fabric.sdk.exception.TransactionException;
+import org.hyperledger.fabric.sdk.helper.Config;
+import org.hyperledger.fabric.sdk.helper.Utils;
+import org.hyperledger.fabric.sdk.security.CryptoSuite;
+
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
@@ -35,31 +47,22 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.hyperledger.fabric.protos.peer.Query.ChaincodeInfo;
-import org.hyperledger.fabric.sdk.exception.CryptoException;
-import org.hyperledger.fabric.sdk.exception.InvalidArgumentException;
-import org.hyperledger.fabric.sdk.exception.NetworkConfigurationException;
-import org.hyperledger.fabric.sdk.exception.ProposalException;
-import org.hyperledger.fabric.sdk.exception.TransactionException;
-import org.hyperledger.fabric.sdk.helper.Config;
-import org.hyperledger.fabric.sdk.helper.Utils;
-import org.hyperledger.fabric.sdk.security.CryptoSuite;
-
 import static java.lang.String.format;
 import static org.hyperledger.fabric.sdk.User.userContextCheck;
 
 public class HFClient {
-    private static final Config config = Config.getConfig(); // never remove this! config needs to load first.
+    /**
+     * never remove this! config needs to load first. 永远不要删除它！配置需要首先加载
+     */
+    private static final Config config = Config.getConfig();
 
     private CryptoSuite cryptoSuite;
-    protected ExecutorService executorService;
+    protected final ExecutorService executorService;
 
     static {
 
         if (null == System.getProperty("org.hyperledger.fabric.sdk.logGRPC")) {
-            // Turn this off by default!
+            // Turn this off by default! 默认关闭此功能！
             Logger.getLogger("io.netty").setLevel(Level.OFF);
             Logger.getLogger("io.grpc").setLevel(Level.OFF);
 
@@ -67,21 +70,6 @@ public class HFClient {
     }
 
     ExecutorService getExecutorService() {
-        if (null == executorService) {
-            synchronized (this) { //was null so lets get a lock for safe update.
-                if (null == executorService) { // no other thread has done it ...
-                    executorService = new ThreadPoolExecutor(CLIENT_THREAD_EXECUTOR_COREPOOLSIZE, CLIENT_THREAD_EXECUTOR_MAXIMUMPOOLSIZE,
-                            CLIENT_THREAD_EXECUTOR_KEEPALIVETIME, CLIENT_THREAD_EXECUTOR_KEEPALIVETIMEUNIT,
-                            new SynchronousQueue<Runnable>(),
-                            r -> {
-                                Thread t = threadFactory.newThread(r);
-                                t.setDaemon(true);
-                                return t;
-                            });
-                }
-            }
-
-        }
         return executorService;
     }
 
@@ -103,6 +91,16 @@ public class HFClient {
     private static final TimeUnit CLIENT_THREAD_EXECUTOR_KEEPALIVETIMEUNIT = config.getClientThreadExecutorKeepAliveTimeUnit();
 
     private HFClient() {
+
+        executorService = new ThreadPoolExecutor(CLIENT_THREAD_EXECUTOR_COREPOOLSIZE, CLIENT_THREAD_EXECUTOR_MAXIMUMPOOLSIZE,
+                CLIENT_THREAD_EXECUTOR_KEEPALIVETIME, CLIENT_THREAD_EXECUTOR_KEEPALIVETIMEUNIT,
+                new SynchronousQueue<Runnable>(),
+                r -> {
+                    Thread t = threadFactory.newThread(r);
+                    t.setDaemon(true);
+                    return t;
+                });
+
     }
 
     public CryptoSuite getCryptoSuite() {
@@ -111,39 +109,27 @@ public class HFClient {
 
     public void setCryptoSuite(CryptoSuite cryptoSuite) throws CryptoException, InvalidArgumentException {
         if (null == cryptoSuite) {
-            throw new InvalidArgumentException("CryptoSuite parameter is null.");
+            throw new InvalidArgumentException("CryptoSuite paramter is null.");
         }
         if (this.cryptoSuite != null && cryptoSuite != this.cryptoSuite) {
             throw new InvalidArgumentException("CryptoSuite may only be set once.");
 
         }
+        //        if (cryptoSuiteFactory == null) {
+        //            cryptoSuiteFactory = cryptoSuite.getCryptoSuiteFactory();
+        //        } else {
+        //            if (cryptoSuiteFactory != cryptoSuite.getCryptoSuiteFactory()) {
+        //                throw new InvalidArgumentException("CryptoSuite is not derivied from cryptosuite factory");
+        //            }
+        //        }
 
         this.cryptoSuite = cryptoSuite;
 
     }
 
     /**
-     * Set executor service  Applications need to set the executor service prior to doing any other operations on the client.
-     *
-     * @param executorService The executor service the application wants to use.
-     * @throws InvalidArgumentException if executor service has been set already.
-     */
-
-    public synchronized void setExecutorService(ExecutorService executorService) throws InvalidArgumentException {
-
-        if (executorService == null) {
-            throw new InvalidArgumentException("Executor service can not be null.");
-        }
-        if (this.executorService != null && this.executorService != executorService) {
-            throw new InvalidArgumentException("Executor service has already been set.");
-        }
-
-        this.executorService = executorService;
-
-    }
-
-    /**
      * createNewInstance create a new instance of the HFClient
+     * createNewInstance创建HFClient的新实例
      *
      * @return client
      */
@@ -152,65 +138,10 @@ public class HFClient {
     }
 
     /**
-     * Set sensible default grpc properties for newPeer and newOrderer.  Only sets values
-     * if they don't already exist.
-     * @param props The properties object to apply defaults to
-     */
-    private void setDefaultProperties(Properties props) {
-        if (!props.containsKey("grpc.NettyChannelBuilderOption.keepAliveTime")) {
-            props.put("grpc.NettyChannelBuilderOption.keepAliveTime", new Object[] {2L, TimeUnit.MINUTES});
-        }
-        if (!props.containsKey("grpc.NettyChannelBuilderOption.keepAliveTimeout")) {
-            props.put("grpc.NettyChannelBuilderOption.keepAliveTimeout", new Object[] {20L, TimeUnit.SECONDS});
-        }
-        if (!props.containsKey("grpc.NettyChannelBuilderOption.keepAliveWithoutCalls")) {
-            props.put("grpc.NettyChannelBuilderOption.keepAliveWithoutCalls",  new Object[] {true});
-        }
-    }
-
-    /**
      * Configures a channel based on information loaded from a Network Config file.
+     * 根据从网络配置文件中加载的信息配置频道
      * Note that it is up to the caller to initialize the returned channel.
-     *
-     * @param channelName                    The name of the channel to be configured
-     * @param networkConfig                  The network configuration to use to configure the channel
-     * @param networkConfigAddPeerHandler    A handler that will create and add peers to the channel.
-     * @param networkConfigAddOrdererHandler A handler that will create orderers and add orderers to the channel.
-     * @return The configured channel, or null if the channel is not defined in the configuration
-     * @throws InvalidArgumentException
-     */
-    public Channel loadChannelFromConfig(String channelName, NetworkConfig networkConfig,
-                                         NetworkConfig.NetworkConfigAddPeerHandler networkConfigAddPeerHandler,
-                                         NetworkConfig.NetworkConfigAddOrdererHandler networkConfigAddOrdererHandler) throws InvalidArgumentException, NetworkConfigurationException {
-        clientCheck();
-
-        // Sanity checks
-        if (channelName == null || channelName.isEmpty()) {
-            throw new InvalidArgumentException("channelName must be specified");
-        }
-
-        if (networkConfig == null) {
-            throw new InvalidArgumentException("networkConfig must be specified");
-        }
-
-        if (null == networkConfigAddPeerHandler) {
-            throw new InvalidArgumentException("networkConfigAddPeerHandler is null.");
-        }
-
-        if (null == networkConfigAddOrdererHandler) {
-            throw new InvalidArgumentException("networkConfigAddOrdererHandler is null.");
-        }
-
-        if (channels.containsKey(channelName)) {
-            throw new InvalidArgumentException(format("Channel with name %s already exists", channelName));
-        }
-
-        return networkConfig.loadChannel(this, channelName, networkConfigAddPeerHandler, networkConfigAddOrdererHandler);
-    }
-
-    /**
-     * Configures a channel based on information loaded from a Network Config file.
-     * Note that it is up to the caller to initialize the returned channel.
+     * 请注意，调用者必须初始化返回的通道
      *
      * @param channelName   The name of the channel to be configured
      * @param networkConfig The network configuration to use to configure the channel
@@ -220,7 +151,7 @@ public class HFClient {
     public Channel loadChannelFromConfig(String channelName, NetworkConfig networkConfig) throws InvalidArgumentException, NetworkConfigurationException {
         clientCheck();
 
-        // Sanity checks
+        // Sanity checks 健全性检查
         if (channelName == null || channelName.isEmpty()) {
             throw new InvalidArgumentException("channelName must be specified");
         }
@@ -238,6 +169,7 @@ public class HFClient {
 
     /**
      * newChannel - already configured channel.
+     * newChannel-已经配置的通道。
      *
      * @param name
      * @return a new channel.
@@ -267,6 +199,7 @@ public class HFClient {
 
     /**
      * Create a new channel
+     * 创建一个新通道
      *
      * @param name                           The channel's name
      * @param orderer                        Orderer to create the channel with.
@@ -306,6 +239,7 @@ public class HFClient {
 
     /**
      * Deserialize a channel serialized by {@link Channel#serializeChannel()}
+     * 反序列化由{@link Channel＃serializeChannel（）}序列化的频道
      *
      * @param file a file which contains the bytes to be deserialized.
      * @return A Channel that has not been initialized.
@@ -325,6 +259,7 @@ public class HFClient {
 
     /**
      * Deserialize a channel serialized by {@link Channel#serializeChannel()}
+     * 反序列化由{@link Channel＃serializeChannel（）}序列化的频道
      *
      * @param channelBytes bytes to be deserialized.
      * @return A Channel that has not been initialized.
@@ -368,11 +303,12 @@ public class HFClient {
 
     /**
      * newPeer create a new peer
+     * newPeer创建一个新的对等
      *
      * @param name       name of peer.
      * @param grpcURL    to the peer's location
      * @param properties <p>
-     *                   Supported properties
+     *                   es
      *                   <ul>
      *                   <li>pemFile - File location for x509 pem certificate for SSL.</li>
      *                   <li>pemBytes - byte array for x509 pem certificates for SSL</li>
@@ -405,18 +341,37 @@ public class HFClient {
      *                   parameters need to be supplied in an array of Objects.
      *                   </li>
      *                   </ul>
+     * pemFile-SSL的x509 pem证书的文件位置。 *
+     * pemBytes-SSL的x509 pem证书的字节数组 *
+     * trustServerCertificate-boolen（true / false）覆盖CN以匹配pemFile证书-仅用于开发。
+     * *如果pemFile具有目标服务器的证书（而不是CA Root证书），
+     * *指示TLS客户端信任pemFile中证书的CN值，*在开发过程中很有用，可以在
+     * * TLS握手过程中通过默认服务器主机名验证，当服务器主机名与证书不匹配时。 * *
+     * clientKeyFile-相互TLS的私钥pem的文件位置 *
+     * clientCertFile-相互TLS的x509 pem证书的文件位置 *
+     * clientKeyBytes-私有相互TLS的密钥pem字节 *
+     * clientCertBytes-相互TLS的x509 pem证书字节 *
+     * hostnameOverride-指定证书CN-仅用于开发。 *
+     * sslProvider-指定SSL提供程序，openSSL或JDK。 *
+     * negotiationType-指定协商类型，TLS或plainText。 *
+     * 如果pemFile不代表服务器证书，请使用此属性指定目标服务器证书中期望的URI权限
+     * *（又名主机名）。这是在TLS握手期间通过默认服务器*主机名验证所必需的。 * *
+     * * peerEventRegistrationWaitTime-等待对等事件服务注册的时间（以毫秒为单位）。 * *
+     * * org.hyperledger.fabric.sdk.peer.organization_mspid {@link Peer＃PEER_ORGANIZATION_MSPID_PROPERTY}-通过其mspid与组织对等。 * *
+     * * grpc.NettyChannelBuilderOption。，其中methodName是
+     * * grpc ManagedChannelBuilder上的任何方法。如果需要对该方法使用多个参数，则需要在Objects数组中提供*参数。 * *
      * @return Peer
      * @throws InvalidArgumentException
      */
 
     public Peer newPeer(String name, String grpcURL, Properties properties) throws InvalidArgumentException {
         clientCheck();
-        setDefaultProperties(properties);
         return Peer.createNewInstance(name, grpcURL, properties);
     }
 
     /**
      * newPeer create a new peer
+     * newPeer创建一个新的对等
      *
      * @param name
      * @param grpcURL to the peer's location
@@ -426,11 +381,12 @@ public class HFClient {
 
     public Peer newPeer(String name, String grpcURL) throws InvalidArgumentException {
         clientCheck();
-        return Peer.createNewInstance(name, grpcURL, new Properties());
+        return Peer.createNewInstance(name, grpcURL, null);
     }
 
     /**
      * getChannel by name
+     * 通过名称获取频道
      *
      * @param name The channel name
      * @return a channel (or null if the channel does not exist)
@@ -442,226 +398,32 @@ public class HFClient {
 
     /**
      * newInstallProposalRequest get new Install proposal request.
+     * newInstallProposalRequest获取新的安装提议请求
      *
      * @return InstallProposalRequest
-     * @deprecated see {@link #newLifecycleQueryInstalledChaincodesRequest()}
      */
-    @Deprecated
     public InstallProposalRequest newInstallProposalRequest() {
         return new InstallProposalRequest(userContext);
     }
 
     /**
-     * newInstallProposalRequest get new Query Install proposal request.
-     *
-     * @return {@link LifecycleInstallChaincodeProposalResponse}
-     */
-    public LifecycleInstallChaincodeRequest newLifecycleInstallChaincodeRequest() {
-        return new LifecycleInstallChaincodeRequest(userContext);
-    }
-
-    /**
-     * Get newLifecycleQueryInstalledChaincodeRequest to find chaincodes installed.
-     *
-     * @return {@link LifecycleInstallChaincodeProposalResponse} finds chaincodes installed.
-     */
-    public LifecycleQueryInstalledChaincodeRequest newLifecycleQueryInstalledChaincodeRequest() {
-        return new LifecycleQueryInstalledChaincodeRequest(userContext);
-    }
-
-    /**
-     * LifecycleQueryInstalledChaincodesRequest get new Query Install proposal request.
-     *
-     * @return {@link LifecycleQueryInstalledChaincodesRequest}
-     */
-    public LifecycleQueryInstalledChaincodesRequest newLifecycleQueryInstalledChaincodesRequest() {
-        return new LifecycleQueryInstalledChaincodesRequest(userContext);
-    }
-
-    /**
-     * newLifecycleApproveChaincodeDefinitionForMyOrgRequest get new Install proposal request.
-     *
-     * @return LifecycleApproveChaincodeDefinitionForMyOrgRequest
-     */
-    public LifecycleApproveChaincodeDefinitionForMyOrgRequest newLifecycleApproveChaincodeDefinitionForMyOrgRequest() {
-        return new LifecycleApproveChaincodeDefinitionForMyOrgRequest(userContext);
-    }
-
-    /**
-     * Get a LifecycleSimulateCommitChaincodeDefinitionRequest to find which chaincodes are approved by which organization.
-     *
-     * @return
-     */
-    public LifecycleCheckCommitReadinessRequest newLifecycleSimulateCommitChaincodeDefinitionRequest() {
-        return new LifecycleCheckCommitReadinessRequest(userContext);
-    }
-
-    /**
-     * newLifecycleApproveChaincodeDefinitionForMyOrgRequest get new Install proposal request.
-     *
-     * @return LifecycleCommitChaincodeDefinitionRequest
-     */
-    public LifecycleCommitChaincodeDefinitionRequest newLifecycleCommitChaincodeDefinitionRequest() {
-        return new LifecycleCommitChaincodeDefinitionRequest(userContext);
-    }
-
-    /**
-     * Create a new QueryChaincodeDefinitions proposal request.
-     *
-     * @return A proposal request.
-     */
-    public LifecycleQueryChaincodeDefinitionsRequest newLifecycleQueryChaincodeDefinitionsRequest() {
-        return new LifecycleQueryChaincodeDefinitionsRequest(userContext);
-    }
-
-    /**
-     * get QueryLifecycleQueryChaincodeDefinitionRequest find which chaincodes are defined.
-     *
-     * @return QueryLifecycleQueryChaincodeDefinitionRequest
-     */
-    public QueryLifecycleQueryChaincodeDefinitionRequest newQueryLifecycleQueryChaincodeDefinitionRequest() {
-        return new QueryLifecycleQueryChaincodeDefinitionRequest(userContext);
-    }
-
-    /**
-     * Send install chaincode request proposal to peers.
-     *
-     * @param lifecycleInstallChaincodeRequest
-     * @param peers                            Collection of peers to install on.
-     * @return responses from peers.
-     * @throws InvalidArgumentException
-     * @throws ProposalException
-     */
-
-    public Collection<LifecycleInstallChaincodeProposalResponse> sendLifecycleInstallChaincodeRequest(LifecycleInstallChaincodeRequest lifecycleInstallChaincodeRequest,
-                                                                                                      Collection<Peer> peers) throws ProposalException, InvalidArgumentException {
-
-        if (null == lifecycleInstallChaincodeRequest) {
-            throw new InvalidArgumentException("The lifecycleInstallChaincodeRequest parameter can not be null.");
-        }
-        clientCheck();
-
-        lifecycleInstallChaincodeRequest.setSubmitted();
-        Channel systemChannel = Channel.newSystemChannel(this);
-
-        return systemChannel.sendLifecycleInstallProposal(lifecycleInstallChaincodeRequest, peers);
-
-    }
-
-    /**
-     * Query installed chaincode on a peer.
-     *
-     * @param lifecycleQueryInstalledChaincodeRequest The request {@link LifecycleQueryInstalledChaincodeRequest}
-     * @param peers                                   the peer to send the request to.
-     * @return LifecycleQueryInstalledChaincodeProposalResponse
-     * @throws InvalidArgumentException
-     * @throws ProposalException
-     */
-
-    public Collection<LifecycleQueryInstalledChaincodeProposalResponse> sendLifecycleQueryInstalledChaincode(LifecycleQueryInstalledChaincodeRequest lifecycleQueryInstalledChaincodeRequest,
-                                                                                                             Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        if (null == lifecycleQueryInstalledChaincodeRequest) {
-            throw new InvalidArgumentException("The lifecycleQueryInstalledChaincodeRequest parameter can not be null.");
-        }
-        clientCheck();
-
-        if (null == peers) {
-
-            throw new InvalidArgumentException("The parameter peers set to null");
-
-        }
-
-        if (peers.isEmpty()) {
-
-            throw new InvalidArgumentException("Peers to query is empty.");
-
-        }
-
-        if (lifecycleQueryInstalledChaincodeRequest == null) {
-            throw new InvalidArgumentException("The lifecycleQueryInstalledChaincoded parameter must not be null.");
-        }
-
-        if (Utils.isNullOrEmpty(lifecycleQueryInstalledChaincodeRequest.getPackageId())) {
-            throw new InvalidArgumentException("The lifecycleQueryInstalledChaincoded packageID parameter must not be null.");
-        }
-
-        try {
-            //Run this on a system channel.
-
-            Channel systemChannel = Channel.newSystemChannel(this);
-
-            return systemChannel.lifecycleQueryInstalledChaincode(lifecycleQueryInstalledChaincodeRequest, peers);
-        } catch (ProposalException e) {
-            logger.error(format("lifecycleQueryInstalledChaincodeRequest for failed. %s", e.getMessage()), e);
-            throw e;
-        }
-
-    }
-
-    /**
-     * Query the peer for installed chaincodes information
-     *
-     * @param lifecycleQueryInstalledChaincodesRequest the request {@link LifecycleQueryInstalledChaincodesRequest}
-     * @param peers                                    The peer to query.
-     * @return Collection of ChaincodeInfo on installed chaincode @see {@link LifecycleQueryInstalledChaincodesProposalResponse}
-     * @throws InvalidArgumentException
-     * @throws ProposalException
-     */
-
-    public Collection<LifecycleQueryInstalledChaincodesProposalResponse> sendLifecycleQueryInstalledChaincodes(LifecycleQueryInstalledChaincodesRequest lifecycleQueryInstalledChaincodesRequest,
-                                                                                                               Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        if (null == lifecycleQueryInstalledChaincodesRequest) {
-            throw new InvalidArgumentException("The lifecycleQueryInstalledChaincodesRequest parameter can not be null.");
-        }
-
-        clientCheck();
-
-        if (null == peers) {
-
-            throw new InvalidArgumentException("The peers set to null");
-
-        }
-
-        if (peers.isEmpty()) {
-            throw new InvalidArgumentException("The peers parameter is empty.");
-        }
-
-        try {
-            //Run this on a system channel.
-            Channel systemChannel = Channel.newSystemChannel(this);
-            return systemChannel.lifecycleQueryInstalledChaincodes(lifecycleQueryInstalledChaincodesRequest, peers);
-        } catch (ProposalException e) {
-            logger.error(e);
-            throw e;
-        }
-
-    }
-
-    /**
      * newInstantiationProposalRequest get new instantiation proposal request.
+     * newInstantiationProposalRequest获取新的实例化提案请求
      *
-     * @return see {@link InstantiateProposalRequest}
-     * @deprecated See {@link LifecycleCommitChaincodeDefinitionRequest } for defining the chaincode and
-     * and then {@link TransactionProposalRequest#setInit(boolean)} to do the initialization if it's required by the chaincode.
+     * @return InstantiateProposalRequest
      */
-    @Deprecated
+
     public InstantiateProposalRequest newInstantiationProposalRequest() {
         return new InstantiateProposalRequest(userContext);
     }
 
-    /**
-     * @return {@link UpgradeProposalRequest}
-     * @deprecated See {@link LifecycleCommitChaincodeDefinitionRequest } for defining the chaincode and
-     * and then {@link TransactionProposalRequest#setInit(boolean)} to do the initialization if it's required by the chaincode.     */
-    @Deprecated
     public UpgradeProposalRequest newUpgradeProposalRequest() {
         return new UpgradeProposalRequest(userContext);
     }
 
     /**
      * newTransactionProposalRequest  get new transaction proposal request.
+     * newTransactionProposalRequest获取新的交易建议请求。
      *
      * @return TransactionProposalRequest
      */
@@ -672,6 +434,7 @@ public class HFClient {
 
     /**
      * newQueryProposalRequest get new query proposal request.
+     * newQueryProposalRequest获取新的查询提议请求
      *
      * @return QueryByChaincodeRequest
      */
@@ -682,18 +445,17 @@ public class HFClient {
 
     /**
      * Set the User context for this client.
+     * 设置此客户端的用户上下文
      *
      * @param userContext
      * @return the old user context. Maybe null if never set!
-     * @throws IllegalStateException if no crypto suite has been set.
-     * @throws NullPointerException if the user context is null.
-     * @throws IllegalArgumentException if the user context is not valid.
+     * @throws InvalidArgumentException
      */
 
-    public User setUserContext(User userContext) {
+    public User setUserContext(User userContext) throws InvalidArgumentException {
 
         if (null == cryptoSuite) {
-            throw new IllegalStateException("No cryptoSuite has been set.");
+            throw new InvalidArgumentException("No cryptoSuite has been set.");
         }
         userContextCheck(userContext);
 
@@ -707,7 +469,79 @@ public class HFClient {
     }
 
     /**
+     * Create a new Eventhub.
+     * 创建一个新的Eventhub
+     *
+     * @param name       name of Eventhub.
+     * @param grpcURL    url location of orderer grpc or grpcs protocol.
+     * @param properties <p>
+     *                   es
+     *                   <ul>
+     *                   <li>pemFile - File location for x509 pem certificate for SSL.</li>
+     *                   <li>pemBytes - byte array for x509 pem certificates for SSL</li>
+     *                   <li>trustServerCertificate - boolean(true/false) override CN to match pemFile certificate -- for development only.
+     *                   If the pemFile has the target server's certificate (instead of a CA Root certificate),
+     *                   instruct the TLS client to trust the CN value of the certificate in the pemFile,
+     *                   useful in development to get past default server hostname verification during
+     *                   TLS handshake, when the server host name does not match the certificate.
+     *                   </li>
+     *                   <li>clientKeyFile - File location for PKCS8-encoded private key pem for mutual TLS</li>
+     *                   <li>clientCertFile - File location for x509 pem certificate for mutual TLS</li>
+     *                   <li>hostnameOverride - Specify the certificates CN -- for development only.
+     *                   <li>sslProvider - Specify the SSL provider, openSSL or JDK.</li>
+     *                   <li>negotiationType - Specify the type of negotiation, TLS or plainText.</li>
+     *                   <li>If the pemFile does not represent the server certificate, use this property to specify the URI authority
+     *                   (a.k.a hostname) expected in the target server's certificate. This is required to get past default server
+     *                   hostname verifications during TLS handshake.
+     *                   </li>
+     *                   <li>
+     *                   grpc.NettyChannelBuilderOption.&lt;methodName&gt;  where methodName is any method on
+     *                   grpc ManagedChannelBuilder.  If more than one argument to the method is needed then the
+     *                   parameters need to be supplied in an array of Objects.
+     *                   </li>
+     *                   </ul>
+     * pemFile-SSL的x509 pem证书的文件位置。 *
+     * pemBytes-SSL的x509 pem证书的字节数组 *
+     * trustServerCertificate-boolean（true / false）覆盖CN以匹配pemFile证书-仅用于开发。
+     * *如果pemFile具有目标服务器的证书（而不是CA Root证书），
+     * *指示TLS客户端信任pemFile中证书的CN值，*在开发过程中很有用，可以在
+     * * TLS握手过程中通过默认服务器主机名验证，当服务器主机名与证书不匹配时。 * *
+     * clientKeyFile-相互TLS的PKCS8编码的私钥pem的文件位置 *
+     * clientCertFile-相互TLS的x509 pem证书的文件位置 *
+     * hostnameOverride-指定证书CN-仅用于开发。 *
+     * sslProvider-指定SSL提供程序，openSSL或JDK。 *
+     * negotiationType-指定协商类型，TLS或plainText。 *
+     * 如果pemFile不代表服务器证书，请使用此属性指定目标服务器证书中期望的URI权限
+     *                   *（又名主机名）。这是在TLS握手期间通过默认服务器*主机名验证所必需的。 * *
+     * * grpc.NettyChannelBuilderOption。，其中methodName是
+     * * grpc ManagedChannelBuilder上的任何方法。如果需要对该方法使用多个参数，则需要在Objects数组中提供*参数。 * *
+     * @return The orderer.
+     * @throws InvalidArgumentException
+     */
+
+    public EventHub newEventHub(String name, String grpcURL, Properties properties) throws InvalidArgumentException {
+        clientCheck();
+        return EventHub.createNewInstance(name, grpcURL, executorService, properties);
+    }
+
+    /**
+     * Create a new event hub
+     * 创建一个新的事件中心
+     *
+     * @param name    Name of eventhup should match peer's name it's associated with.
+     * @param grpcURL The http url location of the event hub
+     * @return event hub
+     * @throws InvalidArgumentException
+     */
+
+    public EventHub newEventHub(String name, String grpcURL) throws InvalidArgumentException {
+        clientCheck();
+        return newEventHub(name, grpcURL, null);
+    }
+
+    /**
      * Create a new urlOrderer.
+     * 创建一个新的urlOrderer
      *
      * @param name    name of the orderer.
      * @param grpcURL url location of orderer grpc or grpcs protocol.
@@ -717,16 +551,17 @@ public class HFClient {
 
     public Orderer newOrderer(String name, String grpcURL) throws InvalidArgumentException {
         clientCheck();
-        return newOrderer(name, grpcURL, new Properties());
+        return newOrderer(name, grpcURL, null);
     }
 
     /**
      * Create a new orderer.
+     * 创建一个新的订购者
      *
      * @param name       name of Orderer.
      * @param grpcURL    url location of orderer grpc or grpcs protocol.
      * @param properties <p>
-     *                   Supported properties
+     *                   es
      *                   <ul>
      *                   <li>pemFile - File location for x509 pem certificate for SSL.</li>
      *                   <li>pemBytes - byte array for x509 pem certificates for SSL</li>
@@ -760,18 +595,39 @@ public class HFClient {
      *                   Orderer to accept requests before timing out. The default is two seconds.
      *                   </li>
      *                   </ul>
+     *
+     * pemFile-SSL的x509 pem证书的文件位置。 *
+     * pemBytes-SSL的x509 pem证书的字节数组 *
+     * trustServerCertificate-boolean（true / false）覆盖CN以匹配pemFile证书-仅用于开发。
+     * *如果pemFile具有目标服务器的证书（而不是CA Root证书），
+     * *指示TLS客户端信任pemFile中证书的CN值，
+     * *在开发过程中很有用，可以在TLS握手过程中通过默认服务器主机名验证，当服务器主机名与证书不匹配时。 * *
+     * clientKeyFile-相互TLS的私钥pem的文件位置 *
+     * clientCertFile-相互TLS的x509 pem证书的文件位置 *
+     * clientKeyBytes-私有相互TLS的密钥pem字节 *
+     * clientCertBytes-相互TLS的x509 pem证书字节 *
+     * sslProvider-指定SSL提供程序，openSSL或JDK。 *
+     * negotiationType-指定协商类型，TLS或plainText。 *
+     * hostnameOverride-指定证书CN-仅用于开发。
+     * *如果pemFile不代表服务器证书，请使用此属性指定目标服务器证书中期望的URI授权
+     * *（也称为主机名）。这是在TLS握手期间通过默认服务器*主机名验证所必需的。 * *
+     * * org.hyperledger.fabric.sdk.orderer.organization_mspid {@link Orderer＃ORDERER_ORGANIZATION_MSPID_PROPERTY}-
+     *                   通过组织的mspid将订购者关联到组织。 * *
+     * * grpc.NettyChannelBuilderOption。，其中methodName是
+     * * grpc ManagedChannelBuilder上的任何方法。如果需要对该方法使用多个参数，则需要在Objects数组中提供*参数。 * *
+     * * ordererWaitTimeMilliSecs在超时之前等待* Orderer接受请求的时间（以毫秒为单位）。默认值为两秒钟。
      * @return The orderer.
      * @throws InvalidArgumentException
      */
 
     public Orderer newOrderer(String name, String grpcURL, Properties properties) throws InvalidArgumentException {
         clientCheck();
-        setDefaultProperties(properties);
         return Orderer.createNewInstance(name, grpcURL, properties);
     }
 
     /**
      * Query the joined channels for peers
+     * 查询对等渠道的加入渠道
      *
      * @param peer the peer to query
      * @return A set of strings with the names of the channels the peer has joined.
@@ -788,12 +644,15 @@ public class HFClient {
 
         }
 
-        //Run this on a system channel.
+        //Run this on a system channel. 在系统通道上运行它
 
         try {
             Channel systemChannel = Channel.newSystemChannel(this);
 
             return systemChannel.queryChannels(peer);
+        } catch (InvalidArgumentException e) {
+            //dont log 不要登录
+            throw e;
         } catch (ProposalException e) {
             logger.error(format("queryChannels for peer %s failed." + e.getMessage(), peer.getName()), e);
             throw e;
@@ -803,14 +662,14 @@ public class HFClient {
 
     /**
      * Query the peer for installed chaincode information
+     * 查询对等方以获取已安装的链码信息
      *
      * @param peer The peer to query.
      * @return List of ChaincodeInfo on installed chaincode @see {@link ChaincodeInfo}
      * @throws InvalidArgumentException
      * @throws ProposalException
-     * @deprecated See {@link LifecycleQueryInstalledChaincodesRequest}
      */
-    @Deprecated
+
     public List<ChaincodeInfo> queryInstalledChaincodes(Peer peer) throws InvalidArgumentException, ProposalException {
 
         clientCheck();
@@ -836,6 +695,7 @@ public class HFClient {
 
     /**
      * Get signature for channel configuration
+     * 获取通道配置的签名
      *
      * @param channelConfiguration
      * @param signer
@@ -855,6 +715,7 @@ public class HFClient {
 
     /**
      * Get signature for update channel configuration
+     * 获取更新通道配置的签名
      *
      * @param updateChannelConfiguration
      * @param signer
@@ -874,15 +735,15 @@ public class HFClient {
 
     /**
      * Send install chaincode request proposal to peers.
+     * 将安装链码请求建议发送给对等方
      *
      * @param installProposalRequest
      * @param peers                  Collection of peers to install on.
      * @return responses from peers.
      * @throws InvalidArgumentException
      * @throws ProposalException
-     * @deprecated See {@link LifecycleInstallChaincodeRequest}
      */
-    @Deprecated
+
     public Collection<ProposalResponse> sendInstallProposal(InstallProposalRequest installProposalRequest,
                                                             Collection<Peer> peers) throws ProposalException, InvalidArgumentException {
 
@@ -907,10 +768,10 @@ public class HFClient {
     void removeChannel(Channel channel) {
         synchronized (channels) {
             final String name = channel.getName();
-            if (channels.get(name) == channel) { // Only remove if it's the same instance.
+            // Only remove if it's the same instance. 如果是同一实例，则仅将其删除
+            if (channels.get(name) == channel) {
                 channels.remove(name);
             }
         }
     }
-
 }

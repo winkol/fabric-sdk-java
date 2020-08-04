@@ -20,7 +20,6 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
-import java.lang.reflect.Constructor;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
@@ -80,7 +79,7 @@ import org.hyperledger.fabric.protos.common.Configtx.ConfigUpdateEnvelope;
 import org.hyperledger.fabric.protos.common.Configtx.ConfigValue;
 import org.hyperledger.fabric.protos.common.Ledger;
 import org.hyperledger.fabric.protos.discovery.Protocol;
-import org.hyperledger.fabric.protos.msp.MspConfigPackage;
+import org.hyperledger.fabric.protos.msp.MspConfig;
 import org.hyperledger.fabric.protos.orderer.Ab;
 import org.hyperledger.fabric.protos.orderer.Ab.BroadcastResponse;
 import org.hyperledger.fabric.protos.orderer.Ab.DeliverResponse;
@@ -88,10 +87,15 @@ import org.hyperledger.fabric.protos.orderer.Ab.SeekInfo;
 import org.hyperledger.fabric.protos.orderer.Ab.SeekPosition;
 import org.hyperledger.fabric.protos.orderer.Ab.SeekSpecified;
 import org.hyperledger.fabric.protos.peer.Configuration;
-import org.hyperledger.fabric.protos.peer.ProposalPackage;
-import org.hyperledger.fabric.protos.peer.ProposalResponsePackage;
+import org.hyperledger.fabric.protos.peer.FabricProposal;
+import org.hyperledger.fabric.protos.peer.FabricProposal.SignedProposal;
+import org.hyperledger.fabric.protos.peer.FabricProposalResponse;
+import org.hyperledger.fabric.protos.peer.FabricProposalResponse.Response;
+import org.hyperledger.fabric.protos.peer.FabricTransaction.ProcessedTransaction;
 import org.hyperledger.fabric.protos.peer.Query;
-import org.hyperledger.fabric.protos.peer.TransactionPackage;
+import org.hyperledger.fabric.protos.peer.Query.ChaincodeInfo;
+import org.hyperledger.fabric.protos.peer.Query.ChaincodeQueryResponse;
+import org.hyperledger.fabric.protos.peer.Query.ChannelQueryResponse;
 import org.hyperledger.fabric.sdk.BlockEvent.TransactionEvent;
 import org.hyperledger.fabric.sdk.Peer.PeerRole;
 import org.hyperledger.fabric.sdk.ServiceDiscovery.SDChaindcode;
@@ -99,7 +103,7 @@ import org.hyperledger.fabric.sdk.ServiceDiscovery.SDEndorser;
 import org.hyperledger.fabric.sdk.ServiceDiscovery.SDEndorserState;
 import org.hyperledger.fabric.sdk.ServiceDiscovery.SDNetwork;
 import org.hyperledger.fabric.sdk.exception.CryptoException;
-import org.hyperledger.fabric.sdk.exception.EventingException;
+import org.hyperledger.fabric.sdk.exception.EventHubException;
 import org.hyperledger.fabric.sdk.exception.InvalidArgumentException;
 import org.hyperledger.fabric.sdk.exception.ProposalException;
 import org.hyperledger.fabric.sdk.exception.ServiceDiscoveryException;
@@ -114,14 +118,6 @@ import org.hyperledger.fabric.sdk.transaction.GetConfigBlockBuilder;
 import org.hyperledger.fabric.sdk.transaction.InstallProposalBuilder;
 import org.hyperledger.fabric.sdk.transaction.InstantiateProposalBuilder;
 import org.hyperledger.fabric.sdk.transaction.JoinPeerProposalBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleApproveChaincodeDefinitionForMyOrgProposalBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleCheckCommitReadinessBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleCommitChaincodeDefinitionProposalBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleInstallProposalBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleQueryChaincodeDefinitionBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleQueryChaincodeDefinitionsBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleQueryInstalledChaincodeBuilder;
-import org.hyperledger.fabric.sdk.transaction.LifecycleQueryInstalledChaincodesBuilder;
 import org.hyperledger.fabric.sdk.transaction.ProposalBuilder;
 import org.hyperledger.fabric.sdk.transaction.ProtoUtils;
 import org.hyperledger.fabric.sdk.transaction.QueryCollectionsConfigBuilder;
@@ -143,6 +139,7 @@ import static org.hyperledger.fabric.sdk.transaction.ProtoUtils.getSignatureHead
 
 /**
  * The class representing a channel with which the client SDK interacts.
+ * 类，表示客户端SDK与之交互的渠道
  * <p>
  */
 public class Channel implements Serializable {
@@ -166,6 +163,7 @@ public class Channel implements Serializable {
     private static final String CHAINCODE_EVENTS_TAG = "CHAINCODE_EVENTS_HANDLE";
     final Collection<Orderer> orderers = Collections.synchronizedCollection(new LinkedList<>());
     private transient Map<String, Orderer> ordererEndpointMap = Collections.synchronizedMap(new HashMap<>());
+    final Collection<EventHub> eventHubs = Collections.synchronizedCollection(new LinkedList<>());
     // Name of the channel is only meaningful to the client
     private final String name;
     private transient String toString;
@@ -174,8 +172,8 @@ public class Channel implements Serializable {
     private final Collection<Peer> peers = Collections.synchronizedSet(new HashSet<>());
     private final Map<Peer, PeerOptions> peerOptionsMap = Collections.synchronizedMap(new HashMap<>());
     private transient Map<String, Peer> peerEndpointMap = Collections.synchronizedMap(new HashMap<>());
-    private final Map<String, Collection<Peer>> peerMSPIDMap = new HashMap<>();
-    private final Map<String, Collection<Orderer>> ordererMSPIDMap = new HashMap<>();
+    private Map<String, Collection<Peer>> peerMSPIDMap = new HashMap<>();
+    private Map<String, Collection<Orderer>> ordererMSPIDMap = new HashMap<>();
     private final Map<PeerRole, Set<Peer>> peerRoleSetMap = Collections.synchronizedMap(new HashMap<>());
     private transient String chaincodeEventUpgradeListenerHandle;
     private transient String transactionListenerProcessorHandle;
@@ -184,7 +182,7 @@ public class Channel implements Serializable {
     transient HFClient client;
     private Set<String> discoveryEndpoints = Collections.synchronizedSet(new HashSet<>());
     /**
-     * Runs processing events from peer service.
+     * Runs processing events from event hubs.
      */
 
     transient Thread eventQueueThread = null;
@@ -193,7 +191,7 @@ public class Channel implements Serializable {
     private transient Block genesisBlock;
     private transient Map<String, MSP> msps = new HashMap<>();
     /**
-     * A queue each peer eventing service writes to.
+     * A queue each eventing hub will write events to.
      */
 
     private transient ChannelEventQue channelEventQue = new ChannelEventQue();
@@ -207,7 +205,7 @@ public class Channel implements Serializable {
     private static final boolean asLocalhost = config.discoverAsLocalhost();
 
     {
-        for (Peer.PeerRole peerRole : EnumSet.allOf(PeerRole.class)) {
+        for (PeerRole peerRole : EnumSet.allOf(PeerRole.class)) {
 
             peerRoleSetMap.put(peerRole, Collections.synchronizedSet(new HashSet<>()));
 
@@ -316,7 +314,9 @@ public class Channel implements Serializable {
 
     /**
      * For requests that are not targeted for a specific channel.
+     * 对于不针对特定渠道的请求
      * User's can not directly create this channel.
+     * 用户不能直接创建此频道
      *
      * @param client
      * @return a new system channel.
@@ -329,6 +329,7 @@ public class Channel implements Serializable {
 
     /**
      * createNewInstance
+     * 创建新实例
      *
      * @param name
      * @return A new channel
@@ -384,10 +385,26 @@ public class Channel implements Serializable {
         for (Orderer orderer : orderers) {
             ordererEndpointMap.put(orderer.getEndpoint(), orderer);
         }
+
+        for (EventHub eventHub : getEventHubs()) {
+            eventHub.setEventQue(channelEventQue);
+        }
+
+    }
+
+    /**
+     * Get all Event Hubs on this channel.
+     * 获取此频道上的所有事件中心
+     *
+     * @return Event Hubs
+     */
+    public Collection<EventHub> getEventHubs() {
+        return Collections.unmodifiableCollection(eventHubs);
     }
 
     /**
      * Update channel with specified channel configuration.
+     * 使用指定的通道配置更新通道
      *
      * <P></P>Note This is not a thread safe operation
      * @param updateChannelConfiguration Updated Channel configuration
@@ -404,7 +421,9 @@ public class Channel implements Serializable {
 
     /**
      * Update channel with specified channel configuration
+     * 使用指定的通道配置更新通道
      * <P></P>Note This is not a thread safe operation
+     * 注意这不是线程安全操作
      *
      * @param updateChannelConfiguration Channel configuration
      * @param signers                    signers
@@ -419,6 +438,7 @@ public class Channel implements Serializable {
 
     /**
      * Update channel with specified channel configuration
+     * 使用指定的通道配置更新通道
      *
      * @param userContext                The specific user to use.
      * @param updateChannelConfiguration Channel configuration
@@ -437,7 +457,7 @@ public class Channel implements Serializable {
         User.userContextCheck(userContext);
 
         try {
-            final long startLastConfigIndex = getLastConfigIndex(newTransactionContext(userContext), orderer);
+            final long startLastConfigIndex = getLastConfigIndex(getTransactionContext(userContext), orderer);
             logger.trace(format("startLastConfigIndex: %d. Channel config wait time is: %d",
                     startLastConfigIndex, CHANNEL_CONFIG_WAIT_TIME));
 
@@ -448,7 +468,7 @@ public class Channel implements Serializable {
 
             //Try to wait to see the channel got updated but don't fail if we don't see it.
             do {
-                currentLastConfigIndex = getLastConfigIndex(newTransactionContext(userContext), orderer);
+                currentLastConfigIndex = getLastConfigIndex(getTransactionContext(userContext), orderer);
                 if (currentLastConfigIndex == startLastConfigIndex) {
 
                     final long duration = TimeUnit.MILLISECONDS.convert(System.nanoTime() - nanoTimeStart, TimeUnit.NANOSECONDS);
@@ -500,7 +520,7 @@ public class Channel implements Serializable {
             do {
 
                 //Make sure we have fresh transaction context for each try just to be safe.
-                TransactionContext transactionContext = newTransactionContext(userContext);
+                TransactionContext transactionContext = getTransactionContext(userContext);
 
                 ConfigUpdateEnvelope.Builder configUpdateEnvBuilder = ConfigUpdateEnvelope.newBuilder();
 
@@ -596,6 +616,7 @@ public class Channel implements Serializable {
 
     /**
      * Is channel initialized.
+     * 通道已初始化
      *
      * @return true if the channel has been initialized.
      */
@@ -606,6 +627,7 @@ public class Channel implements Serializable {
 
     /**
      * Get the channel name
+     * 获取频道名称
      *
      * @return The name of the channel
      */
@@ -615,6 +637,7 @@ public class Channel implements Serializable {
 
     /**
      * Add a peer to the channel
+     * 将对等方添加到频道
      *
      * @param peer The Peer to add.
      * @return Channel The current channel added.
@@ -628,6 +651,7 @@ public class Channel implements Serializable {
 
     /**
      * Add a peer to the channel
+     * 将对等方添加到频道
      *
      * @param peer        The Peer to add.
      * @param peerOptions see {@link PeerRole}
@@ -680,7 +704,7 @@ public class Channel implements Serializable {
 
         if (isInitialized() && peerOptions.getPeerRoles().contains(PeerRole.EVENT_SOURCE)) {
             try {
-                peer.initiateEventing(newTransactionContext(), getPeersOptions(peer));
+                peer.initiateEventing(getTransactionContext(), getPeersOptions(peer));
             } catch (TransactionException e) {
                 logger.error(format("Error channel %s enabling eventing on peer %s", toString(), peer));
             }
@@ -727,6 +751,7 @@ public class Channel implements Serializable {
     /**
      * Get peers that belong to an organization from the organization's MSPID
      * These values may not be available till after the channel is initialized.
+     * 从组织的MSPID获取属于组织的对等方这些值可能直到通道初始化后才可用
      *
      * @param mspid The organizaiions MSPID
      * @return A collection of Peers that belong to the organization with that mspid.
@@ -751,7 +776,9 @@ public class Channel implements Serializable {
 
     /**
      * Collection of strings which are the MSPIDs of all the peer organization added.
+     * 字符串的集合，这些字符串是所添加的所有对等组织的MSPID
      * These values may not be available till after the channel is initialized.
+     * 在通道初始化之前，这些值可能不可用
      *
      * @return The collection of mspids
      */
@@ -764,6 +791,7 @@ public class Channel implements Serializable {
 
     /**
      * Join the peer to the channel. The peer is added with all roles see {@link PeerOptions}
+     * 将同伴加入频道。已添加具有所有角色的对等方，请参见{@link PeerOptions}
      *
      * @param peer the peer to join the channel.
      * @return
@@ -805,7 +833,7 @@ public class Channel implements Serializable {
     }
 
     /**
-     * @param peer        the peer to join the channel.
+     * @param peer        the peer to join the channel. 同行加入频道
      * @param peerOptions see {@link PeerOptions}
      * @return
      * @throws ProposalException
@@ -826,6 +854,7 @@ public class Channel implements Serializable {
 
     /**
      * Join peer to channel
+     * 加入对等渠道
      *
      * @param orderer     The orderer to get the genesis block.
      * @param peer        the peer to join the channel.
@@ -861,15 +890,15 @@ public class Channel implements Serializable {
 
             final Channel systemChannel = newSystemChannel(client); //channel is not really created and this is targeted to system channel
 
-            TransactionContext transactionContext = systemChannel.newTransactionContext();
+            TransactionContext transactionContext = systemChannel.getTransactionContext();
 
-            ProposalPackage.Proposal joinProposal = JoinPeerProposalBuilder.newBuilder()
+            FabricProposal.Proposal joinProposal = JoinPeerProposalBuilder.newBuilder()
                     .context(transactionContext)
                     .genesisBlock(genesisBlock)
                     .build();
 
             logger.debug("Getting signed proposal.");
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, joinProposal);
+            SignedProposal signedProposal = getSignedProposal(transactionContext, joinProposal);
             logger.debug("Got signed proposal.");
 
             addPeer(peer, peerOptions); //need to add peer.
@@ -904,7 +933,7 @@ public class Channel implements Serializable {
     }
 
     private Block getConfigBlock(List<Peer> peers) throws ProposalException, InvalidArgumentException {
-        return getConfigBlock(newTransactionContext(), peers);
+        return getConfigBlock(getTransactionContext(), peers);
     }
 
     private Block getConfigBlock(TransactionContext transactionContext, List<Peer> peers) throws ProposalException {
@@ -917,12 +946,12 @@ public class Channel implements Serializable {
             throw new ProposalException("No peers go get config block");
         }
 
-        ProposalPackage.SignedProposal signedProposal = null;
+        SignedProposal signedProposal = null;
         try {
 
             transactionContext.verify(false); // can't verify till we get the config block.
 
-            ProposalPackage.Proposal proposal = GetConfigBlockBuilder.newBuilder()
+            FabricProposal.Proposal proposal = GetConfigBlockBuilder.newBuilder()
                     .context(transactionContext)
                     .channelId(name)
                     .build();
@@ -969,8 +998,11 @@ public class Channel implements Serializable {
 
     /**
      * Removes the peer connection from the channel.
+     * 从通道中删除对等连接
      * This does NOT unjoin the peer from from the channel.
+     * 这不会使对等方脱离通道
      * Fabric does not support that at this time -- maybe some day, but not today
+     * Fabric目前不支持该功能-可能有一天，但今天不支持
      *
      * @param peer
      */
@@ -1002,6 +1034,7 @@ public class Channel implements Serializable {
 
     /**
      * Add an Orderer to this channel.
+     * 将订购者添加到此频道
      *
      * @param orderer the orderer to add.
      * @return this channel.
@@ -1094,7 +1127,9 @@ public class Channel implements Serializable {
 
     /**
      * Collection of strings which are the MSPIDs of all the orderer organization added.
+     * 字符串的集合，这些字符串是添加的所有订购者组织的MSPID。
      * These values may not be available till after the channel is initialized.
+     * 在通道初始化之前，这些值可能不可用
      *
      * @return The collection of mspids
      */
@@ -1115,7 +1150,43 @@ public class Channel implements Serializable {
     }
 
     /**
+     * Add an Event Hub to this channel.
+     * 将事件中心添加到此频道
+     *
+     * @param eventHub
+     * @return this channel
+     * @throws InvalidArgumentException
+     */
+
+    public Channel addEventHub(EventHub eventHub) throws InvalidArgumentException {
+
+        if (shutdown) {
+            throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
+        }
+        if (null == eventHub) {
+            throw new InvalidArgumentException("EventHub is invalid can not be null.");
+        }
+
+        logger.debug(format("Channel %s adding event hub %s", toString(), eventHub.toString()));
+        eventHub.setChannel(this);
+        eventHub.setEventQue(channelEventQue);
+        eventHubs.add(eventHub);
+
+        if (isInitialized()) {
+            try {
+                eventHub.connect(getTransactionContext());
+            } catch (EventHubException e) {
+                throw new InvalidArgumentException(e);
+            }
+
+        }
+        return this;
+
+    }
+
+    /**
      * Get the peers for this channel.
+     * 获取该渠道的同行
      *
      * @return the peers.
      */
@@ -1125,6 +1196,7 @@ public class Channel implements Serializable {
 
     /**
      * Get the peers for this channel.
+     * 获取该渠道的同行
      *
      * @return the peers.
      */
@@ -1141,12 +1213,13 @@ public class Channel implements Serializable {
 
     /**
      * Set peerOptions in the channel that has not be initialized yet.
+     * 在尚未初始化的通道中设置peerOptions。
+     *
      *
      * @param peer        the peer to set options on.
      * @param peerOptions see {@link PeerOptions}
      * @return old options.
      */
-
     PeerOptions setPeerOptions(Peer peer, PeerOptions peerOptions) throws InvalidArgumentException {
         if (initialized) {
             throw new InvalidArgumentException(format("Channel %s already initialized.", name));
@@ -1174,6 +1247,7 @@ public class Channel implements Serializable {
 
     /**
      * Initialize the Channel.  Starts the channel. event hubs will connect.
+     * 初始化通道。启动频道。事件中心将连接。
      *
      * @return this channel.
      * @throws InvalidArgumentException
@@ -1229,7 +1303,7 @@ public class Channel implements Serializable {
 
             logger.trace("Starting service discovery.");
 
-            this.serviceDiscovery = new ServiceDiscovery(this, serviceDiscoveryPeers, newTransactionContext());
+            this.serviceDiscovery = new ServiceDiscovery(this, serviceDiscoveryPeers, getTransactionContext());
             serviceDiscovery.fullNetworkDiscovery(true);
             serviceDiscovery.run();
             logger.trace("Completed. service discovery.");
@@ -1239,9 +1313,15 @@ public class Channel implements Serializable {
 
             logger.debug(format("Eventque started %s", "" + eventQueueThread));
 
-            for (Peer peer : getEventingPeers()) {
-                peer.initiateEventing(newTransactionContext(), getPeersOptions(peer));
+            for (EventHub eh : eventHubs) { //Connect all event hubs
+                eh.connect(getTransactionContext());
             }
+
+            for (Peer peer : getEventingPeers()) {
+                peer.initiateEventing(getTransactionContext(), getPeersOptions(peer));
+            }
+
+            logger.debug(format("%d eventhubs initialized", getEventHubs().size()));
 
             transactionListenerProcessorHandle = registerTransactionListenerProcessor(); //Manage transactions.
             logger.debug(format("Channel %s registerTransactionListenerProcessor completed", name));
@@ -1535,8 +1615,10 @@ public class Channel implements Serializable {
 
     /**
      * Set service discovery orderer addition override.
+     * 设置服务发现订购者添加覆盖
      * <p>
      * Any service discovery properties {@link #setServiceDiscoveryProperties(Properties)} should be set before calling this.
+     * 在调用此服务之前，应设置所有服务发现属性{@link #setServiceDiscoveryProperties（Properties）}。
      *
      * @param sdOrdererAddition
      * @return
@@ -1557,8 +1639,10 @@ public class Channel implements Serializable {
 
     /**
      * Get current service discovery orderer addition override.
+     * 获取当前服务发现订购者添加覆盖
      * <p>
      * Any service discovery properties {@link #setServiceDiscoveryProperties(Properties)} should be set before calling this.
+     * 在调用此服务之前，应设置所有服务发现属性{@link #setServiceDiscoveryProperties（Properties）}。
      *
      * @return SDOrdererAddition
      */
@@ -1573,7 +1657,6 @@ public class Channel implements Serializable {
 
     }
 
-    @SafeVarargs
     private static byte[] combineCerts(Collection<byte[]>... certCollections) throws IOException {
         try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
             for (Collection<byte[]> certCollection : certCollections) {
@@ -1777,8 +1860,10 @@ public class Channel implements Serializable {
 
     /**
      * Set service discovery peer addition override.
+     * 设置服务发现对等方添加覆盖
      * <p>
      * Any service discovery properties {@link #setServiceDiscoveryProperties(Properties)} should be set before calling this.
+     * 在调用此服务之前，应设置所有服务发现属性{@link #setServiceDiscoveryProperties（Properties）}。
      *
      * @param sdPeerAddition
      * @return
@@ -1799,8 +1884,10 @@ public class Channel implements Serializable {
 
     /**
      * Get current service discovery peer addition override.
+     * 获取当前服务发现对等方添加覆盖
      * <p>
      * Any service discovery properties {@link #setServiceDiscoveryProperties(Properties)} should be set before calling this.
+     * 在调用此服务之前，应设置所有服务发现属性{@link #setServiceDiscoveryProperties（Properties）}。
      *
      * @return SDOrdererAddition
      */
@@ -1818,6 +1905,7 @@ public class Channel implements Serializable {
     /**
      * load the peer organizations CA certificates into the channel's trust store so that we
      * can verify signatures from peer messages
+     * 将对等组织的CA证书加载到通道的信任存储中，以便我们可以从对等消息中验证签名
      *
      * @throws InvalidArgumentException
      * @throws CryptoException
@@ -1883,7 +1971,7 @@ public class Channel implements Serializable {
 
                 ArrayList<DeliverResponse> deliverResponses = new ArrayList<>();
 
-                seekBlock(newTransactionContext(), seekInfo, deliverResponses, orderer);
+                seekBlock(getTransactionContext(), seekInfo, deliverResponses, orderer);
 
                 DeliverResponse blockresp = deliverResponses.get(1);
                 Block configBlock = blockresp.getBlock();
@@ -1925,6 +2013,7 @@ public class Channel implements Serializable {
 
     /**
      * Is the channel shutdown.
+     * 是通道关闭
      *
      * @return return true if the channel is shutdown.
      */
@@ -1934,6 +2023,7 @@ public class Channel implements Serializable {
 
     /**
      * Get signed byes of the update channel.
+     * 获取更新频道的签名再见
      *
      * @param updateChannelConfiguration
      * @param signer
@@ -1952,7 +2042,7 @@ public class Channel implements Serializable {
 
         try {
 
-            TransactionContext transactionContext = newTransactionContext(signer);
+            TransactionContext transactionContext = getTransactionContext(signer);
 
             final ByteString configUpdate = ByteString.copyFrom(updateChannelConfiguration.getUpdateChannelConfigurationAsBytes());
 
@@ -2020,10 +2110,10 @@ public class Channel implements Serializable {
         if (null != mspv) {
             if (!msps.containsKey(name)) {
 
-                MspConfigPackage.MSPConfig mspConfig = MspConfigPackage.MSPConfig.parseFrom(mspv.getValue());
+                MspConfig.MSPConfig mspConfig = MspConfig.MSPConfig.parseFrom(mspv.getValue());
                 Integer type = mspConfig.getType();
                 if (type == 0) {
-                    MspConfigPackage.FabricMSPConfig fabricMSPConfig = MspConfigPackage.FabricMSPConfig.parseFrom(mspConfig.getConfig());
+                    MspConfig.FabricMSPConfig fabricMSPConfig = MspConfig.FabricMSPConfig.parseFrom(mspConfig.getConfig());
 
                     msps.put(name, new MSP(name, fabricMSPConfig));
                 }
@@ -2046,8 +2136,10 @@ public class Channel implements Serializable {
 
         /**
          * The actual config update @see {@link UpdateChannelConfiguration}
+         * 实际的配置更新@see {@link UpdateChannelConfiguration}
          *
          * @return The config update. May be null when there is an error on no change needs to be done.
+         * 配置更新。如果存在不需要更改的错误，则可以为null。
          */
         public UpdateChannelConfiguration getUpdateChannelConfiguration() {
             return updateChannelConfiguration;
@@ -2055,6 +2147,7 @@ public class Channel implements Serializable {
 
         /**
          * The peers to be added.
+         * 要添加的对等体
          *
          * @return The anchor peers to be added. This is less any that may be already present.
          */
@@ -2064,6 +2157,7 @@ public class Channel implements Serializable {
 
         /**
          * The peers to be removed..
+         * 对等体将被删除
          *
          * @return The anchor peers to be removed. This is less any peers not present.
          */
@@ -2073,6 +2167,7 @@ public class Channel implements Serializable {
 
         /**
          * The anchor peers found in the current channel configuration.
+         * 在当前通道配置中找到的锚点对等点
          *
          * @return The anchor peers found in the current channel configuration.
          */
@@ -2082,6 +2177,7 @@ public class Channel implements Serializable {
 
         /**
          * The anchor peers found in the updated channel configuration.
+         * 在更新的通道配置中找到了锚点对等点
          */
         public Collection<String> getUpdatedPeers() {
             return updatedPeers;
@@ -2133,7 +2229,9 @@ public class Channel implements Serializable {
 
     /**
      * Get a channel configuration update to add or remove peers.
+     * 获取频道配置更新以添加或删除对等方
      * If both peersToAdd AND peersToRemove are null then only the current anchor peers are reported with @see {@link AnchorPeersConfigUpdateResult#getCurrentPeers()}
+     *如果peersToAdd和peersToRemove均为空，则仅使用@see {@link AnchorPeersConfigUpdateResult＃getCurrentPeers（）}报告当前的锚点对等点。
      *
      * @param peer          peer to use to the channel configuration from.
      * @param userContext   The usercontext to use.
@@ -2314,7 +2412,7 @@ public class Channel implements Serializable {
 
             if (!peersToAddHS.contains(s)) {
                 String[] split = s.split(":");
-                anchorPeers.addAnchorPeers(Configuration.AnchorPeer.newBuilder().setHost(split[0]).setPort(Integer.parseInt(split[1])).build());
+                anchorPeers.addAnchorPeers(Configuration.AnchorPeer.newBuilder().setHost(split[0]).setPort(new Integer(split[1])).build());
                 peersFinalHS.add(s);
             }
         }
@@ -2323,7 +2421,7 @@ public class Channel implements Serializable {
             if (!currentAP.contains(s)) {
                 peersAdded.add(s);
                 String[] split = s.split(":");
-                anchorPeers.addAnchorPeers(Configuration.AnchorPeer.newBuilder().setHost(split[0]).setPort(Integer.parseInt(split[1])).build());
+                anchorPeers.addAnchorPeers(Configuration.AnchorPeer.newBuilder().setHost(split[0]).setPort(new Integer(split[1])).build());
                 peersFinalHS.add(s);
             }
         }
@@ -2392,6 +2490,7 @@ public class Channel implements Serializable {
 
     /**
      * Provide the Channel's latest raw Configuration Block.
+     * 提供通道的最新原始配置块
      *
      * @param orderer
      * @return Channel configuration block.
@@ -2445,7 +2544,7 @@ public class Channel implements Serializable {
     }
 
     private String[] parseEndpoint(String endPoint) throws InvalidArgumentException {
-        if (isNullOrEmpty(endPoint)) {
+        if (Utils.isNullOrEmpty(endPoint)) {
             throw new InvalidArgumentException("Endpoint is null or empty string");
         }
 
@@ -2477,6 +2576,7 @@ public class Channel implements Serializable {
 
     /**
      * Get channel configuration from a specific Orderer
+     * 从特定订购者获取渠道配置
      *
      * @param userContext The user to sign the action.
      * @param orderer     To retrieve the configuration from.
@@ -2488,7 +2588,7 @@ public class Channel implements Serializable {
     public byte[] getChannelConfigurationBytes(User userContext, Orderer orderer) throws InvalidArgumentException, TransactionException {
 
         try {
-            Block configBlock = getConfigurationBlock(newTransactionContext(userContext), orderer);
+            Block configBlock = getConfigurationBlock(getTransactionContext(userContext), orderer);
 
             Envelope envelopeRet = Envelope.parseFrom(configBlock.getData().getData(0));
 
@@ -2505,6 +2605,7 @@ public class Channel implements Serializable {
 
     /**
      * Get channel configuration from a specific peer
+     * 从特定对等方获取通道配置
      *
      * @param userContext The user to sign the action.
      * @param peer        To retrieve the configuration from.
@@ -2516,7 +2617,7 @@ public class Channel implements Serializable {
     public byte[] getChannelConfigurationBytes(User userContext, Peer peer) throws InvalidArgumentException, TransactionException {
 
         try {
-            Block configBlock = getConfigBlock(newTransactionContext(userContext), Collections.singletonList(peer));
+            Block configBlock = getConfigBlock(getTransactionContext(userContext), Arrays.asList(peer));
 
             Envelope envelopeRet = Envelope.parseFrom(configBlock.getData().getData(0));
 
@@ -2537,9 +2638,13 @@ public class Channel implements Serializable {
 
     /**
      * Channel Configuration bytes. Bytes that can be used with configtxlator tool to upgrade the channel.
+     * 通道配置字节。可以与configtxlator工具一起使用的字节，以升级通道。
      * If Peers exist on the channel config block will be retrieved from them.
+     * 如果对等体存在于通道配置块中，将从它们中检索。
      * If only Orderers exist the configblock is retrieved from them.
+     * 如果仅存在订购者，则从他们中检索configblock
      * Convert to Json for editing  with:
+     * 转换为Json以使用以下命令进行编辑：
      * {@code
      * <p>
      * curl -v   POST --data-binary @fooConfig http://host/protolator/decode/common.Config
@@ -2558,7 +2663,7 @@ public class Channel implements Serializable {
             Collection<Peer> peers = getShuffledPeers();
 
             if (!peers.isEmpty()) { // prefer peers.
-                configBlock = getConfigBlock(newTransactionContext(userContext), new ArrayList<>(peers));
+                configBlock = getConfigBlock(getTransactionContext(userContext), new ArrayList<>(peers));
 
             } else { // no peers so look to orderers.
 
@@ -2571,7 +2676,7 @@ public class Channel implements Serializable {
                 String sep = "";
                 for (Orderer orderer : shuffledOrderers) {
                     try {
-                        configBlock = getConfigurationBlock(newTransactionContext(userContext), orderer);
+                        configBlock = getConfigurationBlock(getTransactionContext(userContext), orderer);
                         fe = null; // looks good.
                         break;
                     } catch (Exception e) {
@@ -2779,14 +2884,14 @@ public class Channel implements Serializable {
 
     /**
      * Send instantiate request to the channel. Chaincode is created and initialized.
+     * 向通道发送实例化请求。 Chaincode已创建并初始化。
      *
      * @param instantiateProposalRequest send instantiate chaincode proposal request.
      * @return Collections of proposal responses
      * @throws InvalidArgumentException
      * @throws ProposalException
-     * @deprecated See new lifecycle chaincode management. {@link LifecycleInstallChaincodeRequest}
      */
-    @Deprecated
+
     public Collection<ProposalResponse> sendInstantiationProposal(InstantiateProposalRequest instantiateProposalRequest) throws InvalidArgumentException, ProposalException {
 
         return sendInstantiationProposal(instantiateProposalRequest, getChaincodePeers());
@@ -2794,15 +2899,14 @@ public class Channel implements Serializable {
 
     /**
      * Send instantiate request to the channel. Chaincode is created and initialized.
+     * 向通道发送实例化请求。 Chaincode已创建并初始化。
      *
      * @param instantiateProposalRequest
      * @param peers
      * @return responses from peers.
      * @throws InvalidArgumentException
      * @throws ProposalException
-     * @deprecated See new lifecycle chaincode management. {@link LifecycleInstallChaincodeRequest}
      */
-    @Deprecated
     public Collection<ProposalResponse> sendInstantiationProposal(InstantiateProposalRequest instantiateProposalRequest,
                                                                   Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
         checkChannelState();
@@ -2813,7 +2917,7 @@ public class Channel implements Serializable {
         checkPeers(peers);
 
         try {
-            TransactionContext transactionContext = newTransactionContext(instantiateProposalRequest.getUserContext());
+            TransactionContext transactionContext = getTransactionContext(instantiateProposalRequest.getUserContext());
             transactionContext.setProposalWaitTime(instantiateProposalRequest.getProposalWaitTime());
             InstantiateProposalBuilder instantiateProposalbuilder = InstantiateProposalBuilder.newBuilder();
             instantiateProposalbuilder.context(transactionContext);
@@ -2826,8 +2930,8 @@ public class Channel implements Serializable {
             instantiateProposalbuilder.chaincodeCollectionConfiguration(instantiateProposalRequest.getChaincodeCollectionConfiguration());
             instantiateProposalbuilder.setTransientMap(instantiateProposalRequest.getTransientMap());
 
-            ProposalPackage.Proposal instantiateProposal = instantiateProposalbuilder.build();
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, instantiateProposal);
+            FabricProposal.Proposal instantiateProposal = instantiateProposalbuilder.build();
+            SignedProposal signedProposal = getSignedProposal(transactionContext, instantiateProposal);
 
             return sendProposalToPeers(peers, signedProposal, transactionContext);
         } catch (Exception e) {
@@ -2835,48 +2939,28 @@ public class Channel implements Serializable {
         }
     }
 
-    private TransactionContext getTransactionContext(final TransactionRequest request) {
-        return request.getTransactionContext()
-                .orElse(newTransactionContext(request.getUserContext()));
+    private TransactionContext getTransactionContext() throws InvalidArgumentException {
+        return getTransactionContext(client.getUserContext());
     }
 
-    /**
-     * Create a new transaction context based on the client user context. The transaction context can be set on a
-     * {@link TransactionRequest} prior to calling {@link Channel#sendTransactionProposal(TransactionProposalRequest)}
-     * so that the caller can know the transaction ID in advance.
-     * @return A transaction context.
-     */
-    public TransactionContext newTransactionContext() {
-        return newTransactionContext(client.getUserContext());
-    }
-
-    private TransactionContext newTransactionContext(final User userContext) {
-        return new TransactionContext(this, userContext, client.getCryptoSuite());
-    }
-
-    private TransactionContext newTransactionContext(final LifecycleRequest lifecycleRequest) throws InvalidArgumentException {
-        User userContext = lifecycleRequest.getUserContext();
-        if (null == userContext) {
-            userContext = client.getUserContext();
-        }
+    private TransactionContext getTransactionContext(User userContext) throws InvalidArgumentException {
+        userContext = userContext != null ? userContext : client.getUserContext();
 
         userContextCheck(userContext);
 
-        final TransactionContext transactionContext = new TransactionContext(this, userContext, client.getCryptoSuite());
-        transactionContext.setProposalWaitTime(lifecycleRequest.getProposalWaitTime());
-        transactionContext.verify(lifecycleRequest.isVerifiable());
-        return transactionContext;
+        return new TransactionContext(this, userContext, client.getCryptoSuite());
     }
 
     /**
      * Send install chaincode request proposal to all the channels on the peer.
+     * 将安装链码请求建议发送到对等方上的所有渠道。
      *
      * @param installProposalRequest
      * @return
      * @throws ProposalException
      * @throws InvalidArgumentException
      */
-    @Deprecated
+
     Collection<ProposalResponse> sendInstallProposal(InstallProposalRequest installProposalRequest)
             throws ProposalException, InvalidArgumentException {
         return sendInstallProposal(installProposalRequest, getChaincodePeers());
@@ -2885,6 +2969,7 @@ public class Channel implements Serializable {
 
     /**
      * Send install chaincode request proposal to the channel.
+     * 将安装链码请求建议发送到渠道
      *
      * @param installProposalRequest
      * @param peers
@@ -2892,7 +2977,7 @@ public class Channel implements Serializable {
      * @throws ProposalException
      * @throws InvalidArgumentException
      */
-    @Deprecated
+
     Collection<ProposalResponse> sendInstallProposal(InstallProposalRequest installProposalRequest, Collection<Peer> peers)
             throws ProposalException, InvalidArgumentException {
 
@@ -2903,7 +2988,7 @@ public class Channel implements Serializable {
         }
 
         try {
-            TransactionContext transactionContext = newTransactionContext(installProposalRequest.getUserContext());
+            TransactionContext transactionContext = getTransactionContext(installProposalRequest.getUserContext());
             transactionContext.verify(false);  // Install will have no signing cause it's not really targeted to a channel.
             transactionContext.setProposalWaitTime(installProposalRequest.getProposalWaitTime());
             InstallProposalBuilder installProposalbuilder = InstallProposalBuilder.newBuilder();
@@ -2916,8 +3001,8 @@ public class Channel implements Serializable {
             installProposalbuilder.setChaincodeInputStream(installProposalRequest.getChaincodeInputStream());
             installProposalbuilder.setChaincodeMetaInfLocation(installProposalRequest.getChaincodeMetaInfLocation());
 
-            ProposalPackage.Proposal deploymentProposal = installProposalbuilder.build();
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, deploymentProposal);
+            FabricProposal.Proposal deploymentProposal = installProposalbuilder.build();
+            SignedProposal signedProposal = getSignedProposal(transactionContext, deploymentProposal);
 
             return sendProposalToPeers(peers, signedProposal, transactionContext);
         } catch (Exception e) {
@@ -2928,14 +3013,14 @@ public class Channel implements Serializable {
 
     /**
      * Send Upgrade proposal proposal to upgrade chaincode to a new version.
+     * 发送升级提案提案以将链码升级到新版本
      *
      * @param upgradeProposalRequest
      * @return Collection of proposal responses.
      * @throws ProposalException
      * @throws InvalidArgumentException
-     * @deprecated See new Lifecycle chaincode management.  {@link Channel#sendLifecycleApproveChaincodeDefinitionForMyOrgProposal(LifecycleApproveChaincodeDefinitionForMyOrgRequest, Peer)}
      */
-    @Deprecated
+
     public Collection<ProposalResponse> sendUpgradeProposal(UpgradeProposalRequest upgradeProposalRequest) throws ProposalException, InvalidArgumentException {
 
         return sendUpgradeProposal(upgradeProposalRequest, getChaincodePeers());
@@ -2944,15 +3029,15 @@ public class Channel implements Serializable {
 
     /**
      * Send Upgrade proposal proposal to upgrade chaincode to a new version.
+     * 发送升级提案提案以将链码升级到新版本
      *
      * @param upgradeProposalRequest
      * @param peers                  the specific peers to send to.
      * @return Collection of proposal responses.
      * @throws ProposalException
      * @throws InvalidArgumentException
-     * @deprecated See new Lifecycle chaincode management.  {@link Channel#sendLifecycleApproveChaincodeDefinitionForMyOrgProposal(LifecycleApproveChaincodeDefinitionForMyOrgRequest, Peer)}
      */
-    @Deprecated
+
     public Collection<ProposalResponse> sendUpgradeProposal(UpgradeProposalRequest upgradeProposalRequest, Collection<Peer> peers)
             throws InvalidArgumentException, ProposalException {
 
@@ -2964,7 +3049,7 @@ public class Channel implements Serializable {
         }
 
         try {
-            TransactionContext transactionContext = newTransactionContext(upgradeProposalRequest.getUserContext());
+            TransactionContext transactionContext = getTransactionContext(upgradeProposalRequest.getUserContext());
             //transactionContext.verify(false);  // Install will have no signing cause it's not really targeted to a channel.
             transactionContext.setProposalWaitTime(upgradeProposalRequest.getProposalWaitTime());
             UpgradeProposalBuilder upgradeProposalBuilder = UpgradeProposalBuilder.newBuilder();
@@ -2976,7 +3061,7 @@ public class Channel implements Serializable {
             upgradeProposalBuilder.chaincodEndorsementPolicy(upgradeProposalRequest.getChaincodeEndorsementPolicy());
             upgradeProposalBuilder.chaincodeCollectionConfiguration(upgradeProposalRequest.getChaincodeCollectionConfiguration());
 
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, upgradeProposalBuilder.build());
+            SignedProposal signedProposal = getSignedProposal(transactionContext, upgradeProposalBuilder.build());
 
             return sendProposalToPeers(peers, signedProposal, transactionContext);
         } catch (Exception e) {
@@ -2984,10 +3069,10 @@ public class Channel implements Serializable {
         }
     }
 
-    private ProposalPackage.SignedProposal getSignedProposal(TransactionContext transactionContext, ProposalPackage.Proposal proposal) throws CryptoException, InvalidArgumentException {
+    private SignedProposal getSignedProposal(TransactionContext transactionContext, FabricProposal.Proposal proposal) throws CryptoException, InvalidArgumentException {
 
-        ProposalPackage.SignedProposal sp;
-        sp = ProposalPackage.SignedProposal.newBuilder()
+        SignedProposal sp;
+        sp = SignedProposal.newBuilder()
                 .setProposalBytes(proposal.toByteString())
                 .setSignature(transactionContext.signByteString(proposal.toByteArray()))
                 .build();
@@ -3010,9 +3095,12 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for a Block by the block hash.
+     * 通过块哈希查询此通道以获取块
      * The request is retried on each peer on the channel till successful.
+     * 在通道上的每个对等方上重试该请求，直到成功为止。
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param blockHash the hash of the Block in the chain
      * @return the {@link BlockInfo} with the given block Hash
@@ -3025,7 +3113,9 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for a Block by the block hash.
+     * 通过块哈希查询此通道以获取块
      * The request is tried on multiple peers.
+     * 该请求在多个对等方上尝试
      *
      * @param blockHash   the hash of the Block in the chain
      * @param userContext the user context.
@@ -3039,8 +3129,10 @@ public class Channel implements Serializable {
 
     /**
      * Query a peer in this channel for a Block by the block hash.
+     * 通过块哈希查询此通道中的对等点以获取块
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peer      the Peer to query.
      * @param blockHash the hash of the Block in the chain.
@@ -3054,9 +3146,12 @@ public class Channel implements Serializable {
 
     /**
      * Query a peer in this channel for a Block by the block hash.
+     * 通过块哈希查询此通道中的对等点以获取块
      * Each peer is tried until successful response.
+     * 尝试每个对等直到成功响应
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peers     the Peers to query.
      * @param blockHash the hash of the Block in the chain.
@@ -3072,6 +3167,7 @@ public class Channel implements Serializable {
 
     /**
      * Query a peer in this channel for a Block by the block hash.
+     * 通过块哈希查询此通道中的对等点以获取块
      *
      * @param peers       the Peers to query.
      * @param blockHash   the hash of the Block in the chain.
@@ -3213,9 +3309,12 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for a Block by the blockNumber.
+     * 通过blockNumber在此通道中查询一个Block
      * The request is retried on all peers till successful
+     * 在所有对等方上重试该请求，直到成功
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param blockNumber index of the Block in the chain
      * @return the {@link BlockInfo} with the given blockNumber
@@ -3228,7 +3327,9 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for a Block by the blockNumber.
+     * 通过blockNumber在此通道中查询一个Block。
      * The request is sent to a random peer in the channel.
+     * 该请求被发送到通道中的随机对等体。
      *
      * @param blockNumber index of the Block in the chain
      * @param userContext the user context to be used.
@@ -3242,8 +3343,9 @@ public class Channel implements Serializable {
 
     /**
      * Query a peer in this channel for a Block by the blockNumber
-     *
+     * 在该通道中的对等方通过blockNumber查询一个Block
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peer        the peer to send the request to
      * @param blockNumber index of the Block in the chain
@@ -3259,6 +3361,7 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by the blockNumber
+     * 通过blockNumber向该通道的对等方查询一个Block
      *
      * @param peer        the peer to send the request to
      * @param blockNumber index of the Block in the chain
@@ -3275,8 +3378,10 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by the blockNumber
+     * 通过blockNumber向该通道的对等方查询一个Block
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的
      *
      * @param peers       the peers to try and send the request to
      * @param blockNumber index of the Block in the chain
@@ -3291,6 +3396,7 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by the blockNumber
+     * 通过blockNumber向该通道的对等方查询一个Block
      *
      * @param peers       the peers to try and send the request to
      * @param blockNumber index of the Block in the chain
@@ -3322,9 +3428,12 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for a Block by a TransactionID contained in the block
+     * 通过包含在该块中的TransactionID在此通道中查询一个块
      * The request is tried on on each peer till successful.
+     * 在每个对等方上尝试该请求，直到成功为止
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param txID the transactionID to query on
      * @return the {@link BlockInfo} for the Block containing the transaction
@@ -3338,7 +3447,9 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for a Block by a TransactionID contained in the block
+     * 通过包含在该块中的TransactionID在此通道中查询一个块
      * The request is sent to a random peer in the channel
+     * 该请求被发送到该通道中的一个随机对等体
      *
      * @param txID        the transactionID to query on
      * @param userContext the user context.
@@ -3353,8 +3464,9 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by a TransactionID contained in the block
-     *
+     * 通过包含在该通道中的TransactionID查询该通道中的对等方以获取一个Block
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peer the peer to send the request to
      * @param txID the transactionID to query on
@@ -3368,6 +3480,7 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by a TransactionID contained in the block
+     * 通过包含在该通道中的TransactionID查询该通道中的对等方以获取一个Block
      *
      * @param peer        the peer to send the request to
      * @param txID        the transactionID to query on
@@ -3382,8 +3495,10 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by a TransactionID contained in the block
+     * 通过包含在该通道中的TransactionID查询该通道中的对等方以获取一个Block
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peers the peers to try to send the request to.
      * @param txID  the transactionID to query on
@@ -3397,6 +3512,7 @@ public class Channel implements Serializable {
 
     /**
      * query a peer in this channel for a Block by a TransactionID contained in the block
+     * 通过包含在该通道中的TransactionID查询该通道中的对等方以获取一个Block
      *
      * @param peers       the peer to try to send the request to
      * @param txID        the transactionID to query on
@@ -3433,10 +3549,13 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for chain information.
+     * 查询此通道以获取链信息
      * The request is sent to a random peer in the channel
+     * 该请求被发送到该通道中的一个随机对等体
      *
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @return a {@link BlockchainInfo} object containing the chain info requested
      * @throws InvalidArgumentException
@@ -3449,7 +3568,9 @@ public class Channel implements Serializable {
 
     /**
      * query this channel for chain information.
+     * 查询此通道以获取链信息
      * The request is sent to a random peer in the channel
+     * 该请求被发送到该通道中的一个随机对等体
      *
      * @param userContext the user context to use.
      * @return a {@link BlockchainInfo} object containing the chain info requested
@@ -3463,9 +3584,10 @@ public class Channel implements Serializable {
 
     /**
      * query for chain information
-     *
+     * 查询连锁信息
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peer The peer to send the request to
      * @return a {@link BlockchainInfo} object containing the chain info requested
@@ -3480,6 +3602,7 @@ public class Channel implements Serializable {
 
     /**
      * query for chain information
+     * 查询连锁信息
      *
      * @param peer        The peer to send the request to
      * @param userContext the user context to use.
@@ -3525,10 +3648,13 @@ public class Channel implements Serializable {
 
     /**
      * Query this channel for a Fabric Transaction given its transactionID.
+     * 在给定其transactionID的情况下，在此通道中查询Fabric事务
      * The request is sent to a random peer in the channel.
+     * 该请求被发送到通道中的随机对等体
      *
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param txID the ID of the transaction
      * @return a {@link TransactionInfo}
@@ -3545,6 +3671,7 @@ public class Channel implements Serializable {
      *
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param txID        the ID of the transaction
      * @param userContext the user context used.
@@ -3558,9 +3685,10 @@ public class Channel implements Serializable {
 
     /**
      * Query for a Fabric Transaction given its transactionID
-     *
+     * 根据给定的transactionID查询结构事务
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param txID the ID of the transaction
      * @param peer the peer to send the request to
@@ -3574,6 +3702,7 @@ public class Channel implements Serializable {
 
     /**
      * Query for a Fabric Transaction given its transactionID
+     * 根据给定的transactionID查询结构事务
      *
      * @param peer        the peer to send the request to
      * @param txID        the ID of the transaction
@@ -3588,6 +3717,7 @@ public class Channel implements Serializable {
 
     /**
      * Query for a Fabric Transaction given its transactionID
+     * 根据给定的transactionID查询结构事务
      *
      * @param txID        the ID of the transaction
      * @param peers       the peers to try to send the request.
@@ -3615,7 +3745,7 @@ public class Channel implements Serializable {
 
             ProposalResponse proposalResponse = sendProposalSerially(querySCCRequest, peers);
 
-            return new TransactionInfo(txID, TransactionPackage.ProcessedTransaction.parseFrom(proposalResponse.getProposalResponse().getResponse().getPayload()));
+            return new TransactionInfo(txID, ProcessedTransaction.parseFrom(proposalResponse.getProposalResponse().getResponse().getPayload()));
         } catch (Exception e) {
 
             logger.error(e);
@@ -3637,11 +3767,11 @@ public class Channel implements Serializable {
 
         try {
 
-            TransactionContext context = newTransactionContext();
+            TransactionContext context = getTransactionContext();
 
-            ProposalPackage.Proposal q = QueryPeerChannelsBuilder.newBuilder().context(context).build();
+            FabricProposal.Proposal q = QueryPeerChannelsBuilder.newBuilder().context(context).build();
 
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, q);
+            SignedProposal qProposal = getSignedProposal(context, q);
             Collection<ProposalResponse> proposalResponses = sendProposalToPeers(Collections.singletonList(peer), qProposal, context);
 
             if (null == proposalResponses) {
@@ -3659,13 +3789,13 @@ public class Channel implements Serializable {
 
             }
 
-            ProposalResponsePackage.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
+            FabricProposalResponse.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
             if (null == fabricResponse) {
                 throw new ProposalException(format("Peer %s channel query return with empty fabric response", peer.getName()));
 
             }
 
-            final ProposalResponsePackage.Response fabricResponseResponse = fabricResponse.getResponse();
+            final Response fabricResponseResponse = fabricResponse.getResponse();
 
             if (null == fabricResponseResponse) { //not likely but check it.
                 throw new ProposalException(format("Peer %s channel query return with empty fabricResponseResponse", peer.getName()));
@@ -3677,7 +3807,7 @@ public class Channel implements Serializable {
 
             }
 
-            Query.ChannelQueryResponse qr = Query.ChannelQueryResponse.parseFrom(fabricResponseResponse.getPayload());
+            ChannelQueryResponse qr = ChannelQueryResponse.parseFrom(fabricResponseResponse.getPayload());
 
             Set<String> ret = new HashSet<>(qr.getChannelsCount());
 
@@ -3696,7 +3826,7 @@ public class Channel implements Serializable {
 
     }
 
-    List<Query.ChaincodeInfo> queryInstalledChaincodes(Peer peer) throws InvalidArgumentException, ProposalException {
+    List<ChaincodeInfo> queryInstalledChaincodes(Peer peer) throws InvalidArgumentException, ProposalException {
 
         checkPeer(peer);
 
@@ -3706,11 +3836,11 @@ public class Channel implements Serializable {
 
         try {
 
-            TransactionContext context = newTransactionContext();
+            TransactionContext context = getTransactionContext();
 
-            ProposalPackage.Proposal q = QueryInstalledChaincodesBuilder.newBuilder().context(context).build();
+            FabricProposal.Proposal q = QueryInstalledChaincodesBuilder.newBuilder().context(context).build();
 
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, q);
+            SignedProposal qProposal = getSignedProposal(context, q);
             Collection<ProposalResponse> proposalResponses = sendProposalToPeers(Collections.singletonList(peer), qProposal, context);
 
             if (null == proposalResponses) {
@@ -3724,13 +3854,13 @@ public class Channel implements Serializable {
 
             ProposalResponse proposalResponse = proposalResponses.iterator().next();
 
-            ProposalResponsePackage.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
+            FabricProposalResponse.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
             if (null == fabricResponse) {
                 throw new ProposalException(format("Peer %s channel query return with empty fabric response", peer.getName()));
 
             }
 
-            final ProposalResponsePackage.Response fabricResponseResponse = fabricResponse.getResponse();
+            final Response fabricResponseResponse = fabricResponse.getResponse();
 
             if (null == fabricResponseResponse) { //not likely but check it.
                 throw new ProposalException(format("Peer %s channel query return with empty fabricResponseResponse", peer.getName()));
@@ -3742,7 +3872,7 @@ public class Channel implements Serializable {
 
             }
 
-            Query.ChaincodeQueryResponse chaincodeQueryResponse = Query.ChaincodeQueryResponse.parseFrom(fabricResponseResponse.getPayload());
+            ChaincodeQueryResponse chaincodeQueryResponse = ChaincodeQueryResponse.parseFrom(fabricResponseResponse.getPayload());
 
             return chaincodeQueryResponse.getChaincodesList();
 
@@ -3755,502 +3885,36 @@ public class Channel implements Serializable {
 
     }
 
-    //Not public
-    Collection<LifecycleInstallChaincodeProposalResponse> sendLifecycleInstallProposal(LifecycleInstallChaincodeRequest installProposalRequest, Collection<Peer> peers)
-            throws ProposalException, InvalidArgumentException {
-
-        checkChannelState();
-        checkPeers(peers);
-
-        LifecycleChaincodePackage lifecycleChaincodePackage = installProposalRequest.getLifecycleChaincodePackage();
-        if (null == lifecycleChaincodePackage) {
-            throw new InvalidArgumentException("Install request is missing lifecycle package");
-        }
-
-        byte[] chaincodeBytes = lifecycleChaincodePackage.getAsBytes();
-
-        if (null == chaincodeBytes) {
-            throw new InvalidArgumentException("InstallProposalRequest lifecycleChaincodePackage bytes is null.");
-        }
-
-        if (chaincodeBytes.length == 0) {
-            throw new InvalidArgumentException("InstallProposalRequest lifecycleChaincodePackage bytes is empty.");
-        }
-
-        try {
-            TransactionContext transactionContext = newTransactionContext(installProposalRequest);
-            transactionContext.verify(false);  // Install will have no signing cause it's not really targeted to a channel.
-            LifecycleInstallProposalBuilder installProposalbuilder = LifecycleInstallProposalBuilder.newBuilder();
-            installProposalbuilder.setChaincodeBytes(chaincodeBytes);
-            installProposalbuilder.context(transactionContext);
-            ProposalPackage.Proposal deploymentProposal = installProposalbuilder.build();
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, deploymentProposal);
-
-            return sendProposalToPeers(peers, signedProposal, transactionContext, LifecycleInstallChaincodeProposalResponse.class);
-        } catch (Exception e) {
-            throw new ProposalException(e);
-        }
-
-    }
-
-    /**
-     * Approve chaincode to be run on this peer's organization.
-     *
-     * @param lifecycleApproveChaincodeDefinitionForMyOrgRequest the request see {@link LifecycleApproveChaincodeDefinitionForMyOrgRequest}
-     * @param peer
-     * @return A {@link LifecycleApproveChaincodeDefinitionForMyOrgProposalResponse}
-     * @throws ProposalException
-     * @throws InvalidArgumentException
-     */
-
-    public LifecycleApproveChaincodeDefinitionForMyOrgProposalResponse sendLifecycleApproveChaincodeDefinitionForMyOrgProposal(LifecycleApproveChaincodeDefinitionForMyOrgRequest lifecycleApproveChaincodeDefinitionForMyOrgRequest, Peer peer) throws ProposalException, InvalidArgumentException {
-
-        if (null == lifecycleApproveChaincodeDefinitionForMyOrgRequest) {
-            throw new InvalidArgumentException("The lifecycleApproveChaincodeDefinitionForMyOrgRequest parameter can not be null.");
-        }
-
-        Collection<LifecycleApproveChaincodeDefinitionForMyOrgProposalResponse> lifecycleApproveChaincodeDefinitionForMyOrgProposalResponses =
-                sendLifecycleApproveChaincodeDefinitionForMyOrgProposal(lifecycleApproveChaincodeDefinitionForMyOrgRequest, Collections.singleton(peer));
-        return lifecycleApproveChaincodeDefinitionForMyOrgProposalResponses.iterator().next();
-
-    }
-
-    /**
-     * Approve chaincode to be run on this peer's organization.
-     *
-     * @param lifecycleApproveChaincodeDefinitionForMyOrgRequest the request see {@link LifecycleApproveChaincodeDefinitionForMyOrgRequest}
-     * @param peers                                              to send the request to.
-     * @return A {@link LifecycleApproveChaincodeDefinitionForMyOrgProposalResponse}
-     * @throws ProposalException
-     * @throws InvalidArgumentException
-     */
-
-    public Collection<LifecycleApproveChaincodeDefinitionForMyOrgProposalResponse> sendLifecycleApproveChaincodeDefinitionForMyOrgProposal(
-            LifecycleApproveChaincodeDefinitionForMyOrgRequest lifecycleApproveChaincodeDefinitionForMyOrgRequest,
-            Collection<Peer> peers) throws ProposalException, InvalidArgumentException {
-
-        if (null == lifecycleApproveChaincodeDefinitionForMyOrgRequest) {
-            throw new InvalidArgumentException("The lifecycleApproveChaincodeDefinitionForMyOrgRequest parameter can not be null.");
-        }
-
-        checkChannelState();
-        checkPeers(peers);
-
-        try {
-            TransactionContext transactionContext = newTransactionContext(lifecycleApproveChaincodeDefinitionForMyOrgRequest);
-            // transactionContext.verify(true);
-            LifecycleApproveChaincodeDefinitionForMyOrgProposalBuilder approveChaincodeDefinitionForMyOrgProposalBuilder = LifecycleApproveChaincodeDefinitionForMyOrgProposalBuilder.
-                    newBuilder();
-            if (IS_TRACE_LEVEL) {
-
-                logger.trace(format("LifecycleApproveChaincodeDefinitionForMyOrg channel: %s, sequence: %d, chaincodeName: %s, chaincodeVersion: %s, packageId: %s" +
-                                ", sourceUnavailable: %b, isInitRequired: %s, validationParameter: '%s', endorsementPolicyPlugin: %s, validationPlugin: %s",
-                        name,
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.getSequence(),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeName(),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeVersion(),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.getPackageId(),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.isSourceUnavailable(),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.isInitRequired() + "",
-                        toHexString(lifecycleApproveChaincodeDefinitionForMyOrgRequest.getValidationParameter()),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeEndorsementPlugin(),
-                        lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeValidationPlugin()));
-
-            }
-
-            approveChaincodeDefinitionForMyOrgProposalBuilder.context(transactionContext);
-            approveChaincodeDefinitionForMyOrgProposalBuilder.sequence(lifecycleApproveChaincodeDefinitionForMyOrgRequest.getSequence());
-            approveChaincodeDefinitionForMyOrgProposalBuilder.chaincodeName(lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeName());
-            approveChaincodeDefinitionForMyOrgProposalBuilder.version(lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeVersion());
-
-            String packageId = lifecycleApproveChaincodeDefinitionForMyOrgRequest.getPackageId();
-            if (null != packageId) {
-                approveChaincodeDefinitionForMyOrgProposalBuilder.setPackageId(packageId);
-            } else if (!lifecycleApproveChaincodeDefinitionForMyOrgRequest.isSourceUnavailable()) {
-                throw new InvalidArgumentException("The request must have a specific packageId or sourceNone set to true.");
-            }
-
-            Boolean initRequired = lifecycleApproveChaincodeDefinitionForMyOrgRequest.isInitRequired();
-            if (null != initRequired) {
-                approveChaincodeDefinitionForMyOrgProposalBuilder.initRequired(initRequired);
-            }
-
-            final ByteString validationParamter = lifecycleApproveChaincodeDefinitionForMyOrgRequest.getValidationParameter();
-            if (null != validationParamter) {
-                approveChaincodeDefinitionForMyOrgProposalBuilder.setValidationParamter(validationParamter);
-            }
-
-            String chaincodeCodeEndorsementPlugin = lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeEndorsementPlugin();
-            if (null != chaincodeCodeEndorsementPlugin) {
-                approveChaincodeDefinitionForMyOrgProposalBuilder.chaincodeCodeEndorsementPlugin(chaincodeCodeEndorsementPlugin);
-            }
-
-            String chaincodeCodeValidationPlugin = lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeValidationPlugin();
-            if (null != chaincodeCodeValidationPlugin) {
-                approveChaincodeDefinitionForMyOrgProposalBuilder.chaincodeCodeValidationPlugin(chaincodeCodeValidationPlugin);
-            }
-
-            ChaincodeCollectionConfiguration chaincodeCollectionConfiguration = lifecycleApproveChaincodeDefinitionForMyOrgRequest.getChaincodeCollectionConfiguration();
-            if (null != chaincodeCollectionConfiguration) {
-                approveChaincodeDefinitionForMyOrgProposalBuilder.chaincodeCollectionConfiguration(chaincodeCollectionConfiguration.getCollectionConfigPackage());
-            }
-
-            ProposalPackage.Proposal deploymentProposal = approveChaincodeDefinitionForMyOrgProposalBuilder.build();
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, deploymentProposal);
-
-            return sendProposalToPeers(peers, signedProposal, transactionContext, LifecycleApproveChaincodeDefinitionForMyOrgProposalResponse.class);
-        } catch (Exception e) {
-            throw new ProposalException(e);
-        }
-
-    }
-
-    /**
-     * Commit chaincode final approval to run on all organizations that have approved.
-     *
-     * @param lifecycleCommitChaincodeDefinitionRequest The request see {@link LifecycleCommitChaincodeDefinitionRequest}
-     * @param peers                                     to send the request to.
-     * @return A {@link LifecycleCommitChaincodeDefinitionProposalResponse}
-     * @throws InvalidArgumentException
-     * @throws ProposalException
-     */
-
-    public Collection<LifecycleCommitChaincodeDefinitionProposalResponse> sendLifecycleCommitChaincodeDefinitionProposal(LifecycleCommitChaincodeDefinitionRequest lifecycleCommitChaincodeDefinitionRequest, Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        if (null == lifecycleCommitChaincodeDefinitionRequest) {
-            throw new InvalidArgumentException("The lifecycleCommitChaincodeDefinitionRequest parameter can not be null.");
-        }
-        checkChannelState();
-        checkPeers(peers);
-
-        try {
-
-            if (IS_TRACE_LEVEL) {
-
-                String collectionData = "null";
-
-                final ChaincodeCollectionConfiguration chaincodeCollectionConfiguration = lifecycleCommitChaincodeDefinitionRequest.getChaincodeCollectionConfiguration();
-                if (null != chaincodeCollectionConfiguration) {
-                    final byte[] asBytes = chaincodeCollectionConfiguration.getAsBytes();
-                    if (null != asBytes) {
-                        collectionData = toHexString(asBytes);
-                    }
-                }
-
-                logger.trace(format("LifecycleCommitChaincodeDefinition channel: %s, sequence: %d, chaincodeName: %s, chaincodeVersion: %s" +
-                                ", isInitRequired: %s, validationParameter: '%s', endorsementPolicyPlugin: %s, validationPlugin: %s" +
-                                ", collectionConfiguration: %s",
-                        name,
-                        lifecycleCommitChaincodeDefinitionRequest.getSequence(),
-                        lifecycleCommitChaincodeDefinitionRequest.getChaincodeName(),
-                        lifecycleCommitChaincodeDefinitionRequest.getChaincodeVersion(),
-
-                        lifecycleCommitChaincodeDefinitionRequest.isInitRequired() + "",
-                        toHexString(lifecycleCommitChaincodeDefinitionRequest.getValidationParameter()),
-                        lifecycleCommitChaincodeDefinitionRequest.getChaincodeEndorsementPlugin(),
-                        lifecycleCommitChaincodeDefinitionRequest.getChaincodeValidationPlugin(),
-                        collectionData));
-
-            }
-            TransactionContext transactionContext = newTransactionContext(lifecycleCommitChaincodeDefinitionRequest);
-            LifecycleCommitChaincodeDefinitionProposalBuilder commitChaincodeDefinitionProposalBuilder = LifecycleCommitChaincodeDefinitionProposalBuilder.newBuilder();
-            commitChaincodeDefinitionProposalBuilder.context(transactionContext);
-            commitChaincodeDefinitionProposalBuilder.chaincodeName(lifecycleCommitChaincodeDefinitionRequest.getChaincodeName());
-            commitChaincodeDefinitionProposalBuilder.version(lifecycleCommitChaincodeDefinitionRequest.getChaincodeVersion());
-            commitChaincodeDefinitionProposalBuilder.sequence(lifecycleCommitChaincodeDefinitionRequest.getSequence());
-            Boolean initRequired = lifecycleCommitChaincodeDefinitionRequest.isInitRequired();
-            if (null != initRequired) {
-                commitChaincodeDefinitionProposalBuilder.initRequired(initRequired);
-            }
-
-            ByteString validationParameter = lifecycleCommitChaincodeDefinitionRequest.getValidationParameter();
-            if (null != validationParameter) {
-
-                commitChaincodeDefinitionProposalBuilder.setValidationParamter(validationParameter);
-
-            }
-
-            String chaincodeCodeEndorsementPlugin = lifecycleCommitChaincodeDefinitionRequest.getChaincodeEndorsementPlugin();
-            if (null != chaincodeCodeEndorsementPlugin) {
-                commitChaincodeDefinitionProposalBuilder.chaincodeCodeEndorsementPlugin(chaincodeCodeEndorsementPlugin);
-            }
-
-            String chaincodeCodeValidationPlugin = lifecycleCommitChaincodeDefinitionRequest.getChaincodeValidationPlugin();
-            if (null != chaincodeCodeValidationPlugin) {
-                commitChaincodeDefinitionProposalBuilder.chaincodeCodeValidationPlugin(chaincodeCodeValidationPlugin);
-            }
-
-            ChaincodeCollectionConfiguration chaincodeCollectionConfiguration = lifecycleCommitChaincodeDefinitionRequest.getChaincodeCollectionConfiguration();
-            if (null != chaincodeCollectionConfiguration) {
-                commitChaincodeDefinitionProposalBuilder.chaincodeCollectionConfiguration(chaincodeCollectionConfiguration.getCollectionConfigPackage());
-            }
-
-            ProposalPackage.Proposal deploymentProposal = commitChaincodeDefinitionProposalBuilder.build();
-            ProposalPackage.SignedProposal signedProposal = getSignedProposal(transactionContext, deploymentProposal);
-
-            return sendProposalToPeers(peers, signedProposal, transactionContext, LifecycleCommitChaincodeDefinitionProposalResponse.class);
-        } catch (Exception e) {
-            throw new ProposalException(e);
-        }
-    }
-
-    // Not public
-    Collection<LifecycleQueryInstalledChaincodesProposalResponse> lifecycleQueryInstalledChaincodes(LifecycleQueryInstalledChaincodesRequest lifecycleQueryInstalledChaincodesRequest, Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        logger.trace("LifecycleQueryInstalledChaincodes");
-        if (null == lifecycleQueryInstalledChaincodesRequest) {
-            throw new InvalidArgumentException("The lifecycleQueryInstalledChaincodesRequest parameter can not be null.");
-        }
-
-        checkPeers(peers);
-
-        if (!isSystemChannel()) {
-            throw new InvalidArgumentException("LifecycleQueryInstalledChaincodes should only be invoked on system channel.");
-        }
-
-        try {
-
-            TransactionContext context = newTransactionContext(lifecycleQueryInstalledChaincodesRequest);
-
-            ProposalPackage.Proposal proposalBuilder = LifecycleQueryInstalledChaincodesBuilder.newBuilder().context(context).build();
-
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, proposalBuilder);
-
-            return sendProposalToPeers(peers, qProposal, context, LifecycleQueryInstalledChaincodesProposalResponse.class);
-
-        } catch (ProposalException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new ProposalException(format("Query for peer %s channels failed. " + e.getMessage(), name), e);
-
-        }
-
-    }
-
-    // Not public
-    Collection<LifecycleQueryInstalledChaincodeProposalResponse> lifecycleQueryInstalledChaincode(LifecycleQueryInstalledChaincodeRequest lifecycleQueryInstalledChaincodeRequest,
-                                                                                                  Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        if (null == lifecycleQueryInstalledChaincodeRequest) {
-            throw new InvalidArgumentException("The lifecycleQueryInstalledChaincodeRequest parameter can not be null.");
-        }
-
-        checkPeers(peers);
-
-        if (!isSystemChannel()) {
-            throw new InvalidArgumentException("LifecycleQueryInstalledChaincodes should only be invoked on system channel.");
-        }
-
-        try {
-            logger.trace(format("LifecycleQueryInstalledChaincode packageID: %s", lifecycleQueryInstalledChaincodeRequest.getPackageId()));
-
-            TransactionContext context = newTransactionContext(lifecycleQueryInstalledChaincodeRequest);
-
-            LifecycleQueryInstalledChaincodeBuilder lifecycleQueryInstalledChaincodeBuilder = LifecycleQueryInstalledChaincodeBuilder.newBuilder();
-
-            lifecycleQueryInstalledChaincodeBuilder.setPackageId(lifecycleQueryInstalledChaincodeRequest.getPackageId());
-            lifecycleQueryInstalledChaincodeBuilder.context(context);
-
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, lifecycleQueryInstalledChaincodeBuilder.build());
-            return sendProposalToPeers(peers, qProposal, context, LifecycleQueryInstalledChaincodeProposalResponse.class);
-
-        } catch (ProposalException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new ProposalException(format("Query for peer %s channels failed. " + e.getMessage(), name), e);
-
-        }
-
-    }
-
-    /**
-     * Query namespaces.  Takes no specific arguments returns namespaces including chaincode names that have been committed.
-     *
-     * @param proposalRequest the request.
-     * @param peers The peers to which the request will be sent.
-     * @return Peer responses.
-     * @throws InvalidArgumentException if the channel is in an invalid state.
-     * @throws ProposalException
-     */
-
-    public Collection<LifecycleQueryChaincodeDefinitionsProposalResponse> lifecycleQueryChaincodeDefinitions(LifecycleQueryChaincodeDefinitionsRequest proposalRequest, Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-        if (null == proposalRequest) {
-            throw new InvalidArgumentException("The proposal request can not be null.");
-        }
-        checkChannelState();
-        checkPeers(peers);
-
-        try {
-            logger.trace(format("lifecycleQueryChaincodeDefinitions channel: %s", name));
-
-            TransactionContext context = newTransactionContext(proposalRequest);
-            LifecycleQueryChaincodeDefinitionsBuilder proposalBuilder = LifecycleQueryChaincodeDefinitionsBuilder.newBuilder();
-            proposalBuilder.context(context);
-            ProposalPackage.SignedProposal proposal = getSignedProposal(context, proposalBuilder.build());
-
-            return sendProposalToPeers(peers, proposal, context, LifecycleQueryChaincodeDefinitionsProposalResponse.class);
-        } catch (Exception e) {
-            throw new ProposalException(format("QueryChaincodeDefinitions %s channel failed. " + e.getMessage(), name), e);
-        }
-    }
-
-    /**
-     * Query approval status for all organizations.
-     *
-     * @param lifecycleCheckCommitReadinessRequest The request see {@link LifecycleCheckCommitReadinessRequest}
-     * @param peers                               Peers to send the request. Usually only need one.
-     * @return A {@link LifecycleCheckCommitReadinessProposalResponse}
-     * @throws InvalidArgumentException
-     * @throws ProposalException
-     */
-    public Collection<LifecycleCheckCommitReadinessProposalResponse> sendLifecycleCheckCommitReadinessRequest(LifecycleCheckCommitReadinessRequest lifecycleCheckCommitReadinessRequest, Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        if (null == lifecycleCheckCommitReadinessRequest) {
-            throw new InvalidArgumentException("The lifecycleSimulateCommitChaincodeDefinitionRequest parameter can not be null.");
-        }
-
-        checkChannelState();
-        checkPeers(peers);
-
-        try {
-
-            if (IS_TRACE_LEVEL) {
-
-                String collectionData = "null";
-
-                final org.hyperledger.fabric.protos.peer.Collection.CollectionConfigPackage chaincodeCollectionConfiguration = lifecycleCheckCommitReadinessRequest.getCollectionConfigPackage();
-                if (null != chaincodeCollectionConfiguration) {
-                    final byte[] asBytes = chaincodeCollectionConfiguration.toByteArray();
-                    if (null != asBytes) {
-                        collectionData = toHexString(asBytes);
-                    }
-                }
-
-                logger.trace(format("LifecycleSimulateCommitChaincodeDefinition channel: %s, sequence: %d, chaincodeName: %s, chaincodeVersion: %s" +
-                                ", isInitRequired: %s, validationParameter: '%s', endorsementPolicyPlugin: %s, validationPlugin: %s" +
-                                ", collectionConfiguration: %s",
-                        name,
-                        lifecycleCheckCommitReadinessRequest.getSequence(),
-                        lifecycleCheckCommitReadinessRequest.getChaincodeName(),
-                        lifecycleCheckCommitReadinessRequest.getChaincodeVersion(),
-
-                        lifecycleCheckCommitReadinessRequest.isInitRequired() + "",
-                        toHexString(lifecycleCheckCommitReadinessRequest.getValidationParameter()),
-                        lifecycleCheckCommitReadinessRequest.getChaincodeEndorsementPlugin(),
-                        lifecycleCheckCommitReadinessRequest.getChaincodeValidationPlugin(),
-                        collectionData));
-
-            }
-
-            TransactionContext context = newTransactionContext(lifecycleCheckCommitReadinessRequest);
-
-            LifecycleCheckCommitReadinessBuilder lifecycleCheckCommitReadinessBuilder = LifecycleCheckCommitReadinessBuilder.newBuilder();
-            lifecycleCheckCommitReadinessBuilder.setSequence(lifecycleCheckCommitReadinessRequest.getSequence());
-            lifecycleCheckCommitReadinessBuilder.setName(lifecycleCheckCommitReadinessRequest.getChaincodeName());
-            lifecycleCheckCommitReadinessBuilder.setVersion(lifecycleCheckCommitReadinessRequest.getChaincodeVersion());
-            String endorsementPlugin = lifecycleCheckCommitReadinessRequest.getChaincodeEndorsementPlugin();
-            if (!isNullOrEmpty(endorsementPlugin)) {
-                lifecycleCheckCommitReadinessBuilder.setEndorsementPlugin(endorsementPlugin);
-            }
-            String validationPlugin = lifecycleCheckCommitReadinessRequest.getChaincodeValidationPlugin();
-
-            if (!isNullOrEmpty(validationPlugin)) {
-                lifecycleCheckCommitReadinessBuilder.setValidationPlugin(validationPlugin);
-            }
-
-            ByteString validationParameter = lifecycleCheckCommitReadinessRequest.getValidationParameter();
-            if (null != validationParameter) {
-                lifecycleCheckCommitReadinessBuilder.setValidationParameter(validationParameter);
-            }
-
-            org.hyperledger.fabric.protos.peer.Collection.CollectionConfigPackage collectionConfigPackage = lifecycleCheckCommitReadinessRequest.getCollectionConfigPackage();
-
-            if (null != collectionConfigPackage) {
-                lifecycleCheckCommitReadinessBuilder.setCollections(collectionConfigPackage);
-            }
-
-            Boolean initRequired = lifecycleCheckCommitReadinessRequest.isInitRequired();
-            if (null != initRequired) {
-                lifecycleCheckCommitReadinessBuilder.setInitRequired(initRequired);
-            }
-
-            lifecycleCheckCommitReadinessBuilder.context(context);
-
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, lifecycleCheckCommitReadinessBuilder.build());
-            return sendProposalToPeers(peers, qProposal, context, LifecycleCheckCommitReadinessProposalResponse.class);
-
-        } catch (Exception e) {
-            throw new ProposalException(format("CheckCommitReadiness %s channel failed. " + e.getMessage(), name), e);
-
-        }
-    }
-
-    /**
-     * lifecycleQueryChaincodeDefinition get definition of chaincode.
-     *
-     * @param queryLifecycleQueryChaincodeDefinitionRequest The request see {@link QueryLifecycleQueryChaincodeDefinitionRequest}
-     * @param peers                                         The peers to send the request to.
-     * @return A {@link LifecycleQueryChaincodeDefinitionProposalResponse}
-     * @throws InvalidArgumentException
-     * @throws ProposalException
-     */
-
-    public Collection<LifecycleQueryChaincodeDefinitionProposalResponse> lifecycleQueryChaincodeDefinition(
-            QueryLifecycleQueryChaincodeDefinitionRequest queryLifecycleQueryChaincodeDefinitionRequest, Collection<Peer> peers) throws InvalidArgumentException, ProposalException {
-
-        if (null == queryLifecycleQueryChaincodeDefinitionRequest) {
-            throw new InvalidArgumentException("The queryLifecycleQueryChaincodeDefinitionRequest parameter can not be null.");
-        }
-
-        checkChannelState();
-        checkPeers(peers);
-
-        try {
-
-            logger.trace(format("LifecycleQueryChaincodeDefinition channel: %s, chaincode name: %s", name, queryLifecycleQueryChaincodeDefinitionRequest.getChaincodeName()));
-            TransactionContext context = newTransactionContext(queryLifecycleQueryChaincodeDefinitionRequest);
-            LifecycleQueryChaincodeDefinitionBuilder lifecycleQueryChaincodeDefinitionBuilder = LifecycleQueryChaincodeDefinitionBuilder.newBuilder();
-            lifecycleQueryChaincodeDefinitionBuilder.context(context).setChaincodeName(queryLifecycleQueryChaincodeDefinitionRequest.getChaincodeName());
-
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, lifecycleQueryChaincodeDefinitionBuilder.build());
-            return sendProposalToPeers(peers, qProposal, context, LifecycleQueryChaincodeDefinitionProposalResponse.class);
-
-        } catch (ProposalException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new ProposalException(format("Query for peer %s channels failed. " + e.getMessage(), name), e);
-
-        }
-
-    }
-
     /**
      * Query peer for chaincode that has been instantiated
+     * 查询同位体以获取已实例化的链码
      *
      * <STRONG>This method may not be thread safe if client context is changed!</STRONG>
+     * 如果更改了客户端上下文，则此方法可能不是线程安全的！
      *
      * @param peer The peer to query.
-     * @return A list of ChaincodeInfo @see {@link Query.ChaincodeInfo}
+     * @return A list of ChaincodeInfo @see {@link ChaincodeInfo}
      * @throws InvalidArgumentException
      * @throws ProposalException
      */
 
-    public List<Query.ChaincodeInfo> queryInstantiatedChaincodes(Peer peer) throws InvalidArgumentException, ProposalException {
+    public List<ChaincodeInfo> queryInstantiatedChaincodes(Peer peer) throws InvalidArgumentException, ProposalException {
         return queryInstantiatedChaincodes(peer, client.getUserContext());
 
     }
 
     /**
      * Query peer for chaincode that has been instantiated
+     * 查询同位体以获取已实例化的链码
      *
      * @param peer        The peer to query.
      * @param userContext the user context.
-     * @return A list of ChaincodeInfo @see {@link Query.ChaincodeInfo}
+     * @return A list of ChaincodeInfo @see {@link ChaincodeInfo}
      * @throws InvalidArgumentException
      * @throws ProposalException
      */
 
-    public List<Query.ChaincodeInfo> queryInstantiatedChaincodes(Peer peer, User userContext) throws InvalidArgumentException, ProposalException {
+    public List<ChaincodeInfo> queryInstantiatedChaincodes(Peer peer, User userContext) throws InvalidArgumentException, ProposalException {
 
         checkChannelState();
         checkPeer(peer);
@@ -4258,11 +3922,11 @@ public class Channel implements Serializable {
 
         try {
 
-            TransactionContext context = newTransactionContext(userContext);
+            TransactionContext context = getTransactionContext(userContext);
 
-            ProposalPackage.Proposal q = QueryInstantiatedChaincodesBuilder.newBuilder().context(context).build();
+            FabricProposal.Proposal q = QueryInstantiatedChaincodesBuilder.newBuilder().context(context).build();
 
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, q);
+            SignedProposal qProposal = getSignedProposal(context, q);
             Collection<ProposalResponse> proposalResponses = sendProposalToPeers(Collections.singletonList(peer), qProposal, context);
 
             if (null == proposalResponses) {
@@ -4276,13 +3940,13 @@ public class Channel implements Serializable {
 
             ProposalResponse proposalResponse = proposalResponses.iterator().next();
 
-            ProposalResponsePackage.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
+            FabricProposalResponse.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
             if (null == fabricResponse) {
                 throw new ProposalException(format("Peer %s channel query return with empty fabric response", peer.getName()));
 
             }
 
-            final ProposalResponsePackage.Response fabricResponseResponse = fabricResponse.getResponse();
+            final Response fabricResponseResponse = fabricResponse.getResponse();
 
             if (null == fabricResponseResponse) { //not likely but check it.
                 throw new ProposalException(format("Peer %s channel query return with empty fabricResponseResponse", peer.getName()));
@@ -4294,7 +3958,7 @@ public class Channel implements Serializable {
 
             }
 
-            Query.ChaincodeQueryResponse chaincodeQueryResponse = Query.ChaincodeQueryResponse.parseFrom(fabricResponseResponse.getPayload());
+            ChaincodeQueryResponse chaincodeQueryResponse = ChaincodeQueryResponse.parseFrom(fabricResponseResponse.getPayload());
 
             return chaincodeQueryResponse.getChaincodesList();
 
@@ -4309,6 +3973,7 @@ public class Channel implements Serializable {
 
     /**
      * Get information on the collections used by the chaincode.
+     * 获取有关链码使用的集合的信息
      *
      * @param chaincodeName The name of the chaincode to query.
      * @param peer          Peer to query.
@@ -4320,7 +3985,7 @@ public class Channel implements Serializable {
 
     public CollectionConfigPackage queryCollectionsConfig(String chaincodeName, Peer peer, User userContext) throws InvalidArgumentException, ProposalException {
 
-        if (isNullOrEmpty(chaincodeName)) {
+        if (Utils.isNullOrEmpty(chaincodeName)) {
             throw new InvalidArgumentException("Parameter chaincodeName expected to be non null or empty string.");
         }
         checkChannelState();
@@ -4329,14 +3994,14 @@ public class Channel implements Serializable {
 
         try {
 
-            TransactionContext context = newTransactionContext(userContext);
+            TransactionContext context = getTransactionContext(userContext);
 
             QueryCollectionsConfigBuilder queryCollectionsConfigBuilder = QueryCollectionsConfigBuilder.newBuilder()
                     .context(context).chaincodeName(chaincodeName);
 
-            ProposalPackage.Proposal q = queryCollectionsConfigBuilder.build();
+            FabricProposal.Proposal q = queryCollectionsConfigBuilder.build();
 
-            ProposalPackage.SignedProposal qProposal = getSignedProposal(context, q);
+            SignedProposal qProposal = getSignedProposal(context, q);
             Collection<ProposalResponse> proposalResponses = sendProposalToPeers(Collections.singletonList(peer), qProposal, context);
 
             if (null == proposalResponses) {
@@ -4350,13 +4015,13 @@ public class Channel implements Serializable {
 
             ProposalResponse proposalResponse = proposalResponses.iterator().next();
 
-            ProposalResponsePackage.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
+            FabricProposalResponse.ProposalResponse fabricResponse = proposalResponse.getProposalResponse();
             if (null == fabricResponse) {
                 throw new ProposalException(format("Peer %s channel query return with empty fabric response", peer.getName()));
 
             }
 
-            final ProposalResponsePackage.Response fabricResponseResponse = fabricResponse.getResponse();
+            final Response fabricResponseResponse = fabricResponse.getResponse();
 
             if (null == fabricResponseResponse) { //not likely but check it.
                 throw new ProposalException(format("Peer %s channel query return with empty fabricResponseResponse", peer.getName()));
@@ -4381,6 +4046,7 @@ public class Channel implements Serializable {
 
     /**
      * Send a transaction  proposal.
+     * 发送交易建议
      *
      * @param transactionProposalRequest The transaction proposal to be sent to all the required peers needed for endorsing.
      * @return responses from peers.
@@ -4416,6 +4082,7 @@ public class Channel implements Serializable {
 
     /**
      * Send a transaction  proposal.
+     * 发送交易建议
      *
      * @param transactionProposalRequest The transaction proposal to be sent to all the required peers needed for endorsing.
      * @param discoveryOptions
@@ -4424,7 +4091,7 @@ public class Channel implements Serializable {
      * @throws ProposalException
      */
     public Collection<ProposalResponse> sendTransactionProposalToEndorsers(TransactionProposalRequest transactionProposalRequest, DiscoveryOptions discoveryOptions) throws ProposalException, InvalidArgumentException, ServiceDiscoveryException {
-        final String chaincodeName = transactionProposalRequest.getChaincodeName() != null ? transactionProposalRequest.getChaincodeName() : transactionProposalRequest.getChaincodeID().getName();
+        final String chaincodeName = transactionProposalRequest.getChaincodeID().getName();
         checkChannelState();
         if (null == transactionProposalRequest) {
             throw new InvalidArgumentException("The proposalRequest is null");
@@ -4432,12 +4099,15 @@ public class Channel implements Serializable {
         if (isNullOrEmpty(transactionProposalRequest.getFcn())) {
             throw new InvalidArgumentException("The proposalRequest's fcn is null or empty.");
         }
+        if (transactionProposalRequest.getChaincodeID() == null) {
+            throw new InvalidArgumentException("The proposalRequest's chaincode ID is null");
+        }
         if (null == serviceDiscovery) {
             throw new ServiceDiscoveryException("The channel is not configured with any peers with the 'discover' role");
         }
         logger.debug(format("Channel %s sendTransactionProposalToEndorsers chaincode name: %s", name, chaincodeName));
 
-        TransactionContext transactionContext = getTransactionContext(transactionProposalRequest);
+        TransactionContext transactionContext = getTransactionContext(transactionProposalRequest.getUserContext());
         transactionContext.verify(transactionProposalRequest.doVerify());
         transactionContext.setProposalWaitTime(transactionProposalRequest.getProposalWaitTime());
 
@@ -4446,7 +4116,7 @@ public class Channel implements Serializable {
         proposalBuilder.context(transactionContext);
         proposalBuilder.request(transactionProposalRequest);
 
-        ProposalPackage.SignedProposal invokeProposal = null;
+        SignedProposal invokeProposal = null;
         try {
             invokeProposal = getSignedProposal(transactionContext, proposalBuilder.build());
         } catch (CryptoException e) {
@@ -4720,13 +4390,14 @@ public class Channel implements Serializable {
 
     /**
      * Collection of discovered chaincode names.
+     * 发现的链码名称的集合
      *
      * @return
      */
 
     public Collection<String> getDiscoveredChaincodeNames() {
         if (serviceDiscovery == null) {
-            return Collections.emptyList();
+            return Collections.EMPTY_LIST;
         }
 
         return serviceDiscovery.getDiscoveredChaincodeNames();
@@ -4734,6 +4405,7 @@ public class Channel implements Serializable {
 
     /**
      * Send a transaction proposal to specific peers.
+     * 发送交易建议给特定的同行
      *
      * @param transactionProposalRequest The transaction proposal to be sent to the peers.
      * @param peers
@@ -4748,6 +4420,7 @@ public class Channel implements Serializable {
 
     /**
      * Send Query proposal
+     * 发送查询建议
      *
      * @param queryByChaincodeRequest
      * @return Collection proposal responses.
@@ -4761,6 +4434,7 @@ public class Channel implements Serializable {
 
     /**
      * Send Query proposal
+     * 发送查询建议
      *
      * @param queryByChaincodeRequest
      * @param peers
@@ -4841,8 +4515,12 @@ public class Channel implements Serializable {
             throw new InvalidArgumentException("The proposalRequest's fcn is null or empty.");
         }
 
+        if (proposalRequest.getChaincodeID() == null) {
+            throw new InvalidArgumentException("The proposalRequest's chaincode ID is null");
+        }
+
         try {
-            TransactionContext transactionContext = getTransactionContext(proposalRequest);
+            TransactionContext transactionContext = getTransactionContext(proposalRequest.getUserContext());
             transactionContext.verify(proposalRequest.doVerify());
             transactionContext.setProposalWaitTime(proposalRequest.getProposalWaitTime());
 
@@ -4851,7 +4529,7 @@ public class Channel implements Serializable {
             proposalBuilder.context(transactionContext);
             proposalBuilder.request(proposalRequest);
 
-            ProposalPackage.SignedProposal invokeProposal = getSignedProposal(transactionContext, proposalBuilder.build());
+            SignedProposal invokeProposal = getSignedProposal(transactionContext, proposalBuilder.build());
             return sendProposalToPeers(peers, invokeProposal, transactionContext);
         } catch (ProposalException e) {
             throw e;
@@ -4873,18 +4551,8 @@ public class Channel implements Serializable {
     }
 
     private Collection<ProposalResponse> sendProposalToPeers(Collection<Peer> peers,
-                                                             ProposalPackage.SignedProposal signedProposal,
+                                                             SignedProposal signedProposal,
                                                              TransactionContext transactionContext) throws InvalidArgumentException, ProposalException {
-
-        return sendProposalToPeers(peers,
-                signedProposal,
-                transactionContext, ProposalResponse.class);
-
-    }
-
-    private <T extends ProposalResponse> Collection<T> sendProposalToPeers(Collection<Peer> peers,
-                                                                           ProposalPackage.SignedProposal signedProposal,
-                                                                           TransactionContext transactionContext, Class<T> clazz) throws InvalidArgumentException, ProposalException {
         checkPeers(peers);
 
         if (transactionContext.getVerify()) {
@@ -4895,21 +4563,14 @@ public class Channel implements Serializable {
             }
         }
 
-        Constructor<? extends ProposalResponse> declaredConstructor;
-        try {
-            declaredConstructor = clazz.getDeclaredConstructor(TransactionContext.class, int.class, String.class);
-        } catch (NoSuchMethodException e) {
-            throw new InvalidArgumentException(e);
-        }
-
         final String txID = transactionContext.getTxID();
 
         class Pair {
             private final Peer peer;
 
-            private final Future<ProposalResponsePackage.ProposalResponse> future;
+            private final Future<FabricProposalResponse.ProposalResponse> future;
 
-            private Pair(Peer peer, Future<ProposalResponsePackage.ProposalResponse> future) {
+            private Pair(Peer peer, Future<FabricProposalResponse.ProposalResponse> future) {
                 this.peer = peer;
                 this.future = future;
             }
@@ -4922,21 +4583,25 @@ public class Channel implements Serializable {
             if (null != diagnosticFileDumper) {
                 logger.trace(format("Sending to channel %s, peer: %s, proposal: %s, txID: %s", name, peer, txID,
                         diagnosticFileDumper.createDiagnosticProtobufFile(signedProposal.toByteArray())));
+
             }
 
-            Future<ProposalResponsePackage.ProposalResponse> proposalResponseListenableFuture;
+            Future<FabricProposalResponse.ProposalResponse> proposalResponseListenableFuture;
             try {
                 proposalResponseListenableFuture = peer.sendProposalAsync(signedProposal);
             } catch (Exception e) {
                 proposalResponseListenableFuture = new CompletableFuture<>();
                 ((CompletableFuture) proposalResponseListenableFuture).completeExceptionally(e);
+
             }
             peerFuturePairs.add(new Pair(peer, proposalResponseListenableFuture));
+
         }
 
-        Collection<T> proposalResponses = new ArrayList<>();
+        Collection<ProposalResponse> proposalResponses = new ArrayList<>();
         for (Pair peerFuturePair : peerFuturePairs) {
-            ProposalResponsePackage.ProposalResponse fabricResponse = null;
+
+            FabricProposalResponse.ProposalResponse fabricResponse = null;
             String message;
             int status = 500;
             final String peerName = peerFuturePair.peer.toString();
@@ -4977,14 +4642,7 @@ public class Channel implements Serializable {
                 }
             }
 
-            ProposalResponse proposalResponse = null;
-            try {
-                proposalResponse = declaredConstructor.newInstance(transactionContext, status, message);
-            } catch (Exception e) {
-                throw new InvalidArgumentException(e); // very unlikely to happen.
-            }
-
-            //ProposalResponse proposalResponse = new ProposalResponse(transactionContext, status, message);
+            ProposalResponse proposalResponse = new ProposalResponse(transactionContext, status, message);
             proposalResponse.setProposalResponse(fabricResponse);
             proposalResponse.setProposal(signedProposal);
             proposalResponse.setPeer(peerFuturePair.peer);
@@ -4993,7 +4651,7 @@ public class Channel implements Serializable {
                 proposalResponse.verify(client.getCryptoSuite());
             }
 
-            proposalResponses.add((T) proposalResponse);
+            proposalResponses.add(proposalResponse);
         }
 
         return proposalResponses;
@@ -5001,54 +4659,71 @@ public class Channel implements Serializable {
 
     /**
      * Send transaction to one of the orderers on the channel using a specific user context.
+     * 使用特定的用户上下文将交易发送到渠道上的订购者之一
      *
      * @param proposalResponses The proposal responses to be sent to the orderer.
      * @param userContext       The usercontext used for signing transaction.
      * @return a future allowing access to the result of the transaction invocation once complete.
      */
     public CompletableFuture<TransactionEvent> sendTransaction(Collection<ProposalResponse> proposalResponses, User userContext) {
+
         return sendTransaction(proposalResponses, getOrderers(), userContext);
+
     }
 
     /**
      * Send transaction to one of the orderers on the channel using the usercontext set on the client.
+     * 使用客户端上设置的用户上下文将交易发送到渠道上的一位订购者
      *
      * @param proposalResponses .
      * @return a future allowing access to the result of the transaction invocation once complete.
      */
-    public CompletableFuture<TransactionEvent> sendTransaction(Collection<? extends ProposalResponse> proposalResponses) {
+    public CompletableFuture<TransactionEvent> sendTransaction(Collection<ProposalResponse> proposalResponses) {
+
         return sendTransaction(proposalResponses, getOrderers());
+
     }
 
     /**
      * Send transaction to one of the specified orderers using the usercontext set on the client..
+     * 使用客户端上设置的usercontext将事务发送到指定的订购者之一。
      *
      * @param proposalResponses The proposal responses to be sent to the orderer
      * @param orderers          The orderers to send the transaction to.
      * @return a future allowing access to the result of the transaction invocation once complete.
      */
 
-    public CompletableFuture<TransactionEvent> sendTransaction(Collection<? extends ProposalResponse> proposalResponses, Collection<Orderer> orderers) {
+    public CompletableFuture<TransactionEvent> sendTransaction(Collection<ProposalResponse> proposalResponses, Collection<Orderer> orderers) {
+
         return sendTransaction(proposalResponses, orderers, client.getUserContext());
     }
 
     /**
      * NofEvents may be used with @see {@link TransactionOptions#nOfEvents(NOfEvents)}  to control how reporting Peer service events and Eventhubs will
      * complete the future acknowledging the transaction has been seen by those Peers.
+     * NofEvents可以与@see {@link TransactionOptions＃nOfEvents（NOfEvents）}一起使用，以控制报告对等服务事件和Eventhub将如何*完成将来对那些对等方已看到该事务的确认
      * <p>
      * You can use the method @see {@link #nofNoEvents} to create an NOEvents that will result in the future being completed immediately
      * when the Orderer has accepted the transaction. Note in this case the transaction event will be set to null.
+     * 您可以使用@see {@link #nofNoEvents}方法创建一个NOEvents，该NOEvents将导致将来*当订购者接受交易时立即完成。请注意，在这种情况下，交易事件将设置为null。
      * <p>
      * NofEvents can add Peer Eventing services and Eventhubs that should complete the future. By default all will need to
      * see the transactions to complete the future.  The method @see {@link #setN(int)} can set how many in the group need to see the transaction
      * completion. Essentially setting it to 1 is any.
+     * NofEvents可以添加对等事件服务和Eventhub，它们应在将来完成。默认情况下，所有人都需要*查看交易以完成将来。 @see {@link #setN（int）}方法可以设置要查看交易完成的组中有多少人。
+     * 本质上将其设置为1是任意的。
      * <p>
      * NofEvents may also contain other NofEvent grouping. They can be nested.
+     * NofEvents也可能包含其他NofEvent分组。它们可以嵌套。
      */
+
     public static class NOfEvents {
+
         public NOfEvents setN(int n) {
             if (n < 1) {
+
                 throw new IllegalArgumentException(format("N was %d but needs to be greater than 0.  ", n));
+
             }
             this.n = n;
             return this;
@@ -5059,15 +4734,18 @@ public class Channel implements Serializable {
 
         private long n = Long.MAX_VALUE; //all
 
+        private HashSet<EventHub> eventHubs = new HashSet<>();
         private HashSet<Peer> peers = new HashSet<>();
         private HashSet<NOfEvents> nOfEvents = new HashSet<>();
 
         /**
          * Peers that need to see the transaction event to complete.
+         * 需要查看事务事件才能完成的对等体
          *
          * @param peers The peers that need to see the transaction event to complete.
          * @return This NofEvents.
          */
+
         public NOfEvents addPeers(Peer... peers) {
             if (peers == null || peers.length == 0) {
                 throw new IllegalArgumentException("Peers added must be not null or empty.");
@@ -5075,10 +4753,12 @@ public class Channel implements Serializable {
             this.peers.addAll(Arrays.asList(peers));
 
             return this;
+
         }
 
         /**
          * Peers that need to see the transaction event to complete.
+         * 需要查看事务事件才能完成的对等体
          *
          * @param peers The peers that need to see the transaction event to complete.
          * @return This NofEvents.
@@ -5089,9 +4769,36 @@ public class Channel implements Serializable {
         }
 
         /**
+         * EventHubs that need to see the transaction event to complete.
+         * @param eventHubs The peers that need to see the transaction event to complete.
+         * @return This NofEvents.
+         */
+
+        public NOfEvents addEventHubs(EventHub... eventHubs) {
+            if (eventHubs == null || eventHubs.length == 0) {
+                throw new IllegalArgumentException("EventHubs added must be not null or empty.");
+            }
+            this.eventHubs.addAll(Arrays.asList(eventHubs));
+
+            return this;
+
+        }
+
+        /**
+         * EventHubs that need to see the transaction event to complete.
+         * 需要查看事务事件才能完成的EventHub。
+         * @param eventHubs The peers that need to see the transaction event to complete.
+         * @return This NofEvents.
+         */
+        public NOfEvents addEventHubs(Collection<EventHub> eventHubs) {
+            addEventHubs(eventHubs.toArray(new EventHub[eventHubs.size()]));
+            return this;
+        }
+
+        /**
          * NOfEvents that need to see the transaction event to complete.
-         *
-         * @param nOfEvents The nested event group that need to set the transacton event to complete.
+         * 需要查看事务事件才能完成的NOfEvent。
+         * @param nOfEvents  The nested event group that need to set the transacton event to complete.
          * @return This NofEvents.
          */
 
@@ -5127,17 +4834,19 @@ public class Channel implements Serializable {
 
         /**
          * NOfEvents that need to see the transaction event to complete.
-         *
-         * @param nofs The nested event group that need to set the transacton event to complete.
+         * 需要查看事务事件才能完成的NOfEvent。
+         * @param nofs  The nested event group that need to set the transacton event to complete.
          * @return This NofEvents.
          */
+
         public NOfEvents addNOfs(Collection<NOfEvents> nofs) {
             addNOfs(nofs.toArray(new NOfEvents[nofs.size()]));
             return this;
         }
 
         synchronized Collection<Peer> unSeenPeers() {
-            Set<Peer> unseen = new HashSet<>(16);
+
+            Set<Peer> unseen = new HashSet(16);
             unseen.addAll(peers);
             for (NOfEvents nOfEvents : nOfEvents) {
                 unseen.addAll(nofNoEvents.unSeenPeers());
@@ -5145,18 +4854,67 @@ public class Channel implements Serializable {
             return unseen;
         }
 
+        synchronized Collection<EventHub> unSeenEventHubs() {
+
+            Set<EventHub> unseen = new HashSet(16);
+            unseen.addAll(eventHubs);
+            for (NOfEvents nOfEvents : nOfEvents) {
+                unseen.addAll(nofNoEvents.unSeenEventHubs());
+            }
+            return unseen;
+        }
+
+        synchronized boolean seen(EventHub eventHub) {
+            if (!started) {
+                started = true;
+                n = Long.min(eventHubs.size() + peers.size() + nOfEvents.size(), n);
+            }
+            if (!ready) {
+                if (eventHubs.remove(eventHub)) {
+
+                    if (--n == 0) {
+                        ready = true;
+                    }
+                }
+                if (!ready) {
+                    for (Iterator<NOfEvents> ni = nOfEvents.iterator(); ni.hasNext();
+                    ) { // for check style
+                        NOfEvents e = ni.next();
+                        if (e.seen(eventHub)) {
+                            ni.remove();
+
+                            if (--n == 0) {
+                                ready = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (ready) {
+
+                eventHubs.clear();
+                peers.clear();
+                nOfEvents.clear();
+
+            }
+            return ready;
+        }
+
         synchronized boolean seen(Peer peer) {
             if (!started) {
                 started = true;
-                n = Long.min(peers.size() + nOfEvents.size(), n);
+                n = Long.min(eventHubs.size() + peers.size() + nOfEvents.size(), n);
             }
             if (!ready) {
+
                 if (peers.remove(peer)) {
                     if (--n == 0) {
                         ready = true;
                     }
                 }
                 if (!ready) {
+
                     for (Iterator<NOfEvents> ni = nOfEvents.iterator(); ni.hasNext();
                     ) { // for check style
                         NOfEvents e = ni.next();
@@ -5172,6 +4930,8 @@ public class Channel implements Serializable {
                 }
             }
             if (ready) {
+
+                eventHubs.clear();
                 peers.clear();
                 nOfEvents.clear();
             }
@@ -5186,14 +4946,16 @@ public class Channel implements Serializable {
             started = false;
             this.n = nof.n;
             this.peers = new HashSet<>(nof.peers);
-
+            this.eventHubs = new HashSet<>(nof.eventHubs);
             for (NOfEvents nofc : nof.nOfEvents) {
                 this.nOfEvents.add(new NOfEvents(nofc));
 
             }
         }
 
-        private NOfEvents() { }
+        private NOfEvents() {
+
+        }
 
         public static NOfEvents createNofEvents() {
             return new NOfEvents();
@@ -5201,11 +4963,19 @@ public class Channel implements Serializable {
 
         /**
          * Special NofEvents indicating that no transaction events are needed to complete the Future.
+         * 特殊的NofEvents，指示不需要事务事件即可完成Future。
          * This will result in the Future being completed as soon has the Orderer has seen the transaction.
+         * 一旦订购者看到交易，这将导致期货完成。
          */
+
         public static NOfEvents nofNoEvents = new NOfEvents() {
             @Override
             public NOfEvents addNOfs(NOfEvents... nOfEvents) {
+                throw new IllegalArgumentException("Can not add any events.");
+            }
+
+            @Override
+            public NOfEvents addEventHubs(EventHub... eventHub) {
                 throw new IllegalArgumentException("Can not add any events.");
             }
 
@@ -5220,6 +4990,11 @@ public class Channel implements Serializable {
             }
 
             @Override
+            public NOfEvents addEventHubs(Collection<EventHub> eventHubs) {
+                throw new IllegalArgumentException("Can not add any events.");
+            }
+
+            @Override
             public NOfEvents addPeers(Collection<Peer> peers) {
                 throw new IllegalArgumentException("Can not add any events.");
             }
@@ -5231,25 +5006,32 @@ public class Channel implements Serializable {
 
         public static NOfEvents createNoEvents() {
             return nofNoEvents;
+
         }
+
     }
 
     /**
      * Send transaction to one of a specified set of orderers with the specified user context.
-     * IF there are no eventing peers this future returns immediately completed
+     * 使用指定的用户上下文将交易发送到指定的一组订购者之一。
+     * IF there are no event hubs or eventing peers this future returns immediately completed
      * indicating that orderer has accepted the transaction only.
+     * 如果没有事件中心或事件对等方，则此将来返回立即完成，表明订购者仅接受了交易
      *
      * @param proposalResponses
      * @param orderers
      * @return Future allowing access to the result of the transaction invocation.
      */
-    public CompletableFuture<TransactionEvent> sendTransaction(Collection<? extends ProposalResponse> proposalResponses, Collection<Orderer> orderers, User userContext) {
+
+    public CompletableFuture<TransactionEvent> sendTransaction(Collection<ProposalResponse> proposalResponses, Collection<Orderer> orderers, User userContext) {
         return sendTransaction(proposalResponses, createTransactionOptions().orderers(orderers).userContext(userContext));
     }
 
     /**
      * TransactionOptions class can be used to change how the SDK processes the Transaction.
+     * TransactionOptions类可用于更改SDK处理事务的方式。
      */
+
     public static class TransactionOptions {
         List<Orderer> orderers;
         boolean shuffleOrders = true;
@@ -5258,8 +5040,10 @@ public class Channel implements Serializable {
         boolean failFast = true;
 
         /**
-         * Fail fast when there is an invalid transaction received on the eventing peer being observed.
+         * Fail fast when there is an invalid transaction received on the eventhub or eventing peer being observed.
+         * 当在eventhub或观察到的事件对等方上接收到无效事务时，快速失败
          * The default value is true.
+         * 默认值是true
          *
          * @param failFast fail fast.
          * @return This TransactionOptions
@@ -5271,6 +5055,7 @@ public class Channel implements Serializable {
 
         /**
          * The user context that is to be used. The default is the user context on the client.
+         * 要使用的用户上下文。默认值为客户端上的用户上下文。
          *
          * @param userContext
          * @return This TransactionOptions
@@ -5282,18 +5067,21 @@ public class Channel implements Serializable {
 
         /**
          * The orders to try on this transaction. Each order is tried in turn for a successful submission.
+         * 尝试进行此交易的订单。依次尝试每个订单以成功提交。
          * The default is try all orderers on the chain.
+         * 默认值为尝试链上的所有订购者
          *
          * @param orderers the orderers to try.
          * @return This TransactionOptions
          */
         public TransactionOptions orderers(Orderer... orderers) {
-            this.orderers = new ArrayList<>(Arrays.asList(orderers)); //convert make sure we have a copy.
+            this.orderers = new ArrayList(Arrays.asList(orderers)); //convert make sure we have a copy.
             return this;
         }
 
         /**
          * Shuffle the order the Orderers are tried. The default is true.
+         * 随机排列订购者尝试的顺序。默认值为true
          *
          * @param shuffleOrders
          * @return This TransactionOptions
@@ -5304,11 +5092,13 @@ public class Channel implements Serializable {
         }
 
         /**
-         * Events reporting Eventing Peers to complete the transaction.
+         * Events reporting Eventing Peers and EventHubs to complete the transaction.
+         * 事件报告Eventing Peer和EventHubs完成事务
          * This maybe set to NOfEvents.nofNoEvents that will complete the future as soon as a successful submission
          * to an Orderer, but the completed Transaction event in that case will be null.
+         * 可以将其设置为NOfEvents.nofNoEvents，以在成功提交给订购者后立即完成将来的操作，但是在这种情况下，完成的Transaction事件将为null。
          *
-         * @param nOfEvents More details: @see {@link NOfEvents}
+         * @param nOfEvents See @see {@link NOfEvents}
          * @return This TransactionOptions
          */
         public TransactionOptions nOfEvents(NOfEvents nOfEvents) {
@@ -5327,7 +5117,9 @@ public class Channel implements Serializable {
 
         /**
          * The orders to try on this transaction. Each order is tried in turn for a successful submission.
+         * 尝试进行此交易的订单。依次尝试每个订单以成功提交。
          * The default is try all orderers on the chain.
+         * 默认值为尝试链上的所有订购者
          *
          * @param orderers the orderers to try.
          * @return This TransactionOptions
@@ -5339,8 +5131,11 @@ public class Channel implements Serializable {
 
     /**
      * Additional metadata used by service discovery to find the endorsements needed.
+     * 服务发现使用其他元数据来查找所需的认可
      * Specify which chaincode is invoked and what collections are used.
+     * 指定调用哪个链码以及使用哪些集合
      */
+
     public static class ServiceDiscoveryChaincodeCalls {
         String name;
         List<String> collections;
@@ -5351,10 +5146,12 @@ public class Channel implements Serializable {
 
         /**
          * The collections used by this chaincode.
+         * 此链码使用的集合
          *
          * @param collectionName name of collection.
          * @return
          */
+
         public ServiceDiscoveryChaincodeCalls addCollections(String... collectionName) {
             if (collections == null) {
                 collections = new LinkedList<>();
@@ -5364,6 +5161,7 @@ public class Channel implements Serializable {
         }
 
         String write(List<ServiceDiscoveryChaincodeCalls> dep) {
+
             StringBuilder cns = new StringBuilder(1000);
             cns.append("ServiceDiscoveryChaincodeCalls(name: ").append(name);
 
@@ -5389,22 +5187,26 @@ public class Channel implements Serializable {
                 }
 
                 cns.append("]");
+
             }
             cns.append(")");
 
             return cns.toString();
+
         }
 
         /**
          * Create ch
+         * 创建频道
          *
          * @param name
          * @return
          * @throws InvalidArgumentException
          */
+
         public static ServiceDiscoveryChaincodeCalls createServiceDiscoveryChaincodeCalls(String name) throws InvalidArgumentException {
             if (isNullOrEmpty(name)) {
-                throw new InvalidArgumentException("The name parameter must be non null nor an empty string.");
+                throw new InvalidArgumentException("The name paramter must be non null nor an empty string.");
             }
             return new ServiceDiscoveryChaincodeCalls(name);
         }
@@ -5412,7 +5214,9 @@ public class Channel implements Serializable {
         private Protocol.ChaincodeCall ret = null;
 
         Protocol.ChaincodeCall build() {
+
             if (ret == null) {
+
                 final Protocol.ChaincodeCall.Builder builder = Protocol.ChaincodeCall.newBuilder().setName(name);
                 if (collections != null && !collections.isEmpty()) {
                     builder.addAllCollectionNames(collections);
@@ -5421,6 +5225,7 @@ public class Channel implements Serializable {
             }
 
             return ret;
+
         }
 
         String getName() {
@@ -5428,12 +5233,13 @@ public class Channel implements Serializable {
         }
 
         List<String> getCollections() {
-            return collections == null ? Collections.emptyList() : collections;
+            return collections == null ? Collections.EMPTY_LIST : collections;
         }
     }
 
     /**
      * Options for doing service discovery.
+     * 用于进行服务发现的选项
      */
     public static class DiscoveryOptions {
         Set<String> ignoreList = new HashSet<>();
@@ -5449,6 +5255,7 @@ public class Channel implements Serializable {
 
         /**
          * Create transaction options.
+         * 创建交易选项
          *
          * @return return transaction options.
          */
@@ -5462,6 +5269,7 @@ public class Channel implements Serializable {
 
         /**
          * Set to true to inspect proposals results on error.
+         * 设置为true可以检查提案的错误结果。
          *
          * @param inspectResults
          * @return
@@ -5473,6 +5281,7 @@ public class Channel implements Serializable {
 
         /**
          * Set the handler which selects the endorser endpoints from the alternatives provided by service discovery.
+         * 设置处理程序，该处理程序从服务发现提供的备选方案中选择背书者终结点。
          *
          * @param endorsementSelector
          * @return
@@ -5488,10 +5297,12 @@ public class Channel implements Serializable {
 
         /**
          * Set which other chaincode calls are made by this chaincode and they're collections.
+         * 设置此链码进行哪些其他链码调用，它们是集合。
          *
          * @param serviceDiscoveryChaincodeInterests
          * @return DiscoveryOptions
          */
+
         public DiscoveryOptions setServiceDiscoveryChaincodeInterests(ServiceDiscoveryChaincodeCalls... serviceDiscoveryChaincodeInterests) {
 
             if (this.serviceDiscoveryChaincodeInterests == null) {
@@ -5503,10 +5314,12 @@ public class Channel implements Serializable {
 
         /**
          * Force new service discovery
+         * 强制发现新服务
          *
          * @param forceDiscovery
          * @return
          */
+
         public DiscoveryOptions setForceDiscovery(boolean forceDiscovery) {
             this.forceDiscovery = forceDiscovery;
             return this;
@@ -5527,20 +5340,26 @@ public class Channel implements Serializable {
 
         Collection<String> getIgnoreList() {
             return ignoreList;
+
         }
+
     }
 
     /**
      * Send transaction to one of a specified set of orderers with the specified user context.
-     * IF there are no eventing peers this future returns immediately completed
+     * 使用指定的用户上下文将交易发送到指定的一组订购者之一
+     * IF there are no event hubs or eventing peers this future returns immediately completed
      * indicating that orderer has accepted the transaction only.
+     * 如果没有事件中心或事件对等方，则此将来返回立即完成，表明订购者仅接受了交易
      *
      * @param proposalResponses
      * @param transactionOptions
      * @return Future allowing access to the result of the transaction invocation.
      */
-    public CompletableFuture<TransactionEvent> sendTransaction(Collection<? extends ProposalResponse> proposalResponses,
+
+    public CompletableFuture<TransactionEvent> sendTransaction(Collection<ProposalResponse> proposalResponses,
                                                                TransactionOptions transactionOptions) {
+
         return doSendTransaction(proposalResponses, transactionOptions)
                 .whenComplete((result, exception) -> logCompletion("sendTransaction", result, exception));
     }
@@ -5553,10 +5372,10 @@ public class Channel implements Serializable {
         return result;
     }
 
-    private CompletableFuture<TransactionEvent> doSendTransaction(Collection<? extends ProposalResponse> proposalResponses,
+    private CompletableFuture<TransactionEvent> doSendTransaction(Collection<ProposalResponse> proposalResponses,
                                                                TransactionOptions transactionOptions) {
-
         try {
+
             if (null == transactionOptions) {
                 throw new InvalidArgumentException("Parameter transactionOptions can't be null");
             }
@@ -5586,11 +5405,13 @@ public class Channel implements Serializable {
                             "The proposal responses have %d inconsistent groups with %d that are invalid."
                                     + " Expected all to be consistent and none to be invalid.",
                             consistencyGroups, invalid.size()));
+
                 }
+
             }
 
-            List<ProposalResponsePackage.Endorsement> ed = new LinkedList<>();
-            ProposalPackage.Proposal proposal = null;
+            List<FabricProposalResponse.Endorsement> ed = new LinkedList<>();
+            FabricProposal.Proposal proposal = null;
             ByteString proposalResponsePayload = null;
             String proposalTransactionID = null;
             TransactionContext transactionContext = null;
@@ -5641,10 +5462,16 @@ public class Channel implements Serializable {
                     anyAdded = true;
                     nOfEvents.addPeers(eventingPeers);
                 }
+                Collection<EventHub> eventHubs = getEventHubs();
+                if (!eventHubs.isEmpty()) {
+                    anyAdded = true;
+                    nOfEvents.addEventHubs(getEventHubs());
+                }
 
                 if (!anyAdded) {
                     nOfEvents = NOfEvents.createNoEvents();
                 }
+
             } else if (nOfEvents != NOfEvents.nofNoEvents) {
                 StringBuilder issues = new StringBuilder(100);
                 Collection<Peer> eventingPeers = getEventingPeers();
@@ -5655,10 +5482,17 @@ public class Channel implements Serializable {
                     } else if (!eventingPeers.contains(peer)) {
                         issues.append(format("Peer %s added to NOFEvents is not a eventing Peer in this channel. ", peer.getName()));
                     }
+
+                });
+                nOfEvents.unSeenEventHubs().forEach(eventHub -> {
+                    if (!eventHubs.contains(eventHub)) {
+                        issues.append(format("Eventhub %s added to NOFEvents does not belong this channel. ", eventHub.getName()));
+                    }
+
                 });
 
-                if (nOfEvents.unSeenPeers().isEmpty()) {
-                    issues.append("NofEvents had no added  Peer eventing services.");
+                if (nOfEvents.unSeenEventHubs().isEmpty() && nOfEvents.unSeenPeers().isEmpty()) {
+                    issues.append("NofEvents had no Eventhubs added or Peer eventing services.");
                 }
                 String foundIssues = issues.toString();
                 if (!foundIssues.isEmpty()) {
@@ -5666,12 +5500,12 @@ public class Channel implements Serializable {
                 }
             }
 
-            final boolean replyonly = nOfEvents == NOfEvents.nofNoEvents || (getEventingPeers().isEmpty());
+            final boolean replyonly = nOfEvents == NOfEvents.nofNoEvents || (getEventHubs().isEmpty() && getEventingPeers().isEmpty());
 
             CompletableFuture<TransactionEvent> sret;
-            if (replyonly) { //If there are no eventsto complete the future, complete it
+            if (replyonly) { //If there are no eventhubs to complete the future, complete it
                 // immediately but give no transaction event
-                logger.debug(format("Completing transaction id %s immediately no peer eventing services found in channel %s.", proposalTransactionID, name));
+                logger.debug(format("Completing transaction id %s immediately no event hubs or peer eventing services found in channel %s.", proposalTransactionID, name));
                 sret = new CompletableFuture<>();
             } else {
                 sret = registerTxListener(proposalTransactionID, nOfEvents, transactionOptions.failFast);
@@ -5689,6 +5523,7 @@ public class Channel implements Serializable {
                 }
                 failed = orderer;
                 try {
+
                     if (null != diagnosticFileDumper) {
                         logger.trace(format("Sending to channel %s, orderer: %s, transaction: %s", name, orderer.getName(),
                                 diagnosticFileDumper.createDiagnosticProtobufFile(transactionEnvelope.toByteArray())));
@@ -5713,7 +5548,9 @@ public class Channel implements Serializable {
 
                     logger.error(emsg);
                     lException = new Exception(emsg, e);
+
                 }
+
             }
 
             if (success) {
@@ -5724,6 +5561,7 @@ public class Channel implements Serializable {
                 }
                 return sret;
             } else {
+
                 String emsg = format("Channel %s failed to place transaction %s on Orderer. Cause: UNSUCCESSFUL. %s",
                         name, proposalTransactionID, getRespData(resp));
 
@@ -5734,19 +5572,23 @@ public class Channel implements Serializable {
                 return ret;
             }
         } catch (Exception e) {
+
             CompletableFuture<TransactionEvent> future = new CompletableFuture<>();
             future.completeExceptionally(e);
             return future;
         }
+
     }
 
     /**
      * Build response details
+     * 建立回应详细资料
      *
      * @param resp
      * @return
      */
     private String getRespData(BroadcastResponse resp) {
+
         StringBuilder respdata = new StringBuilder(400);
         if (resp != null) {
             Status status = resp.getStatus();
@@ -5763,7 +5605,9 @@ public class Channel implements Serializable {
                 }
 
                 respdata.append("Additional information: ").append(info);
+
             }
+
         }
 
         return respdata.toString();
@@ -5771,27 +5615,38 @@ public class Channel implements Serializable {
     }
 
     private Envelope createTransactionEnvelope(Payload transactionPayload, TransactionContext transactionContext) throws CryptoException, InvalidArgumentException {
+
         return Envelope.newBuilder()
                 .setPayload(transactionPayload.toByteString())
                 .setSignature(ByteString.copyFrom(transactionContext.sign(transactionPayload.toByteArray())))
                 .build();
+
     }
 
     byte[] getChannelConfigurationSignature(ChannelConfiguration channelConfiguration, User signer) throws InvalidArgumentException {
+
         userContextCheck(signer);
 
         if (null == channelConfiguration) {
+
             throw new InvalidArgumentException("channelConfiguration is null");
+
         }
 
         try {
+
             Envelope ccEnvelope = Envelope.parseFrom(channelConfiguration.getChannelConfigurationAsBytes());
+
             final Payload ccPayload = Payload.parseFrom(ccEnvelope.getPayload());
-            TransactionContext transactionContext = newTransactionContext(signer);
+
+            TransactionContext transactionContext = getTransactionContext(signer);
+
             final ConfigUpdateEnvelope configUpdateEnv = ConfigUpdateEnvelope.parseFrom(ccPayload.getData());
+
             final ByteString configUpdate = configUpdateEnv.getConfigUpdate();
 
             ByteString sigHeaderByteString = getSignatureHeaderAsByteString(signer, transactionContext);
+
             ByteString signatureByteSting = transactionContext.signByteStrings(new User[] {signer},
                     sigHeaderByteString, configUpdate)[0];
 
@@ -5799,135 +5654,60 @@ public class Channel implements Serializable {
                     .setSignatureHeader(sigHeaderByteString)
                     .setSignature(signatureByteSting)
                     .build().toByteArray();
+
         } catch (Exception e) {
+
             throw new InvalidArgumentException(e);
         } finally {
             logger.debug("finally done");
         }
+
     }
 
     /**
      * Register a block listener.
+     * 注册一个块监听器
      *
      * @param listener function with single argument with type {@link BlockEvent}
      * @return The handle of the registered block listener.
      * @throws InvalidArgumentException if the channel is shutdown.
      */
     public String registerBlockListener(BlockListener listener) throws InvalidArgumentException {
+
         if (shutdown) {
             throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
         }
 
-        if (null == listener) {
-            throw new InvalidArgumentException("Listener parameter is null.");
-        }
+        return new BL(listener).getHandle();
 
-        String handle = new BL(listener).getHandle();
-        logger.trace(format("Register event BlockEvent listener %s", handle));
-        return handle;
-    }
-
-    /**
-     * Register a Queued block listener. This queue should never block insertion of events.
-     *
-     * @param blockEventQueue the queue
-     * @return return a handle to ungregister the handler.
-     * @throws InvalidArgumentException
-     */
-    public String registerBlockListener(BlockingQueue<QueuedBlockEvent> blockEventQueue) throws InvalidArgumentException {
-        if (shutdown) {
-            throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
-        }
-
-        if (null == blockEventQueue) {
-            throw new InvalidArgumentException("BlockEventQueue parameter is null.");
-        }
-
-        String handle = new BL(blockEventQueue, -1L, null).getHandle();
-        logger.trace(format("Register QueuedBlockEvent listener %s", handle));
-        return handle;
-    }
-
-    /**
-     * Register a Queued block listener. This queue should never block insertion of events.
-     *
-     * @param blockEventQueue the queue
-     * @param timeout         The time that is waited on for event to be waited on the queue
-     * @param timeUnit        the time unit for timeout.
-     * @return return a handle to ungregister the handler.
-     * @throws InvalidArgumentException
-     */
-    public String registerBlockListener(BlockingQueue<QueuedBlockEvent> blockEventQueue, long timeout, TimeUnit timeUnit) throws InvalidArgumentException {
-        if (shutdown) {
-            throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
-        }
-
-        if (null == blockEventQueue) {
-            throw new InvalidArgumentException("BlockEventQueue parameter is null.");
-        }
-
-        if (timeout < 0L) {
-            throw new InvalidArgumentException(format("Timeout parameter must be greater than 0 not %d", timeout));
-        }
-
-        if (null == timeUnit) {
-            throw new InvalidArgumentException("TimeUnit parameter must not be null.");
-        }
-
-        String handle = new BL(blockEventQueue, timeout, timeUnit).getHandle();
-        logger.trace(format("Register QueuedBlockEvent listener %s", handle));
-        return handle;
     }
 
     /**
      * Unregister a block listener.
+     * 取消注册块侦听器
      *
      * @param handle of Block listener to remove.
      * @return false if not found.
      * @throws InvalidArgumentException if the channel is shutdown or invalid arguments.
      */
     public boolean unregisterBlockListener(String handle) throws InvalidArgumentException {
+
         if (shutdown) {
             throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
         }
 
         checkHandle(BLOCK_LISTENER_TAG, handle);
-        logger.trace(format("Unregister BlockListener with handle %s.", handle));
 
-        LinkedHashMap<String, BL> lblockListeners = blockListeners;
-        if (lblockListeners == null) {
-            return false;
-        }
+        synchronized (blockListeners) {
 
-        synchronized (lblockListeners) {
-            return null != lblockListeners.remove(handle);
-        }
-    }
+            return null != blockListeners.remove(handle);
 
-    public Collection<String> getBlockListenerHandles() throws InvalidArgumentException {
-        if (shutdown) {
-            throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
-        }
-
-        LinkedHashMap<String, BL> lblockListeners = blockListeners;
-        if (lblockListeners == null) {
-            return Collections.emptyList();
-        }
-
-        synchronized (lblockListeners) {
-            Set<String> ret = new HashSet<>(lblockListeners.keySet());
-            // remove the SDKs own transaction block listener.
-            final String ltransactionListenerProcessorHandle = transactionListenerProcessorHandle;
-            if (null != ltransactionListenerProcessorHandle) {
-                ret.remove(ltransactionListenerProcessorHandle);
-            }
-
-            return Collections.unmodifiableSet(ret);
         }
     }
     //////////  Transaction monitoring  /////////////////////////////
 
     private void startEventQue() {
+
         if (eventQueueThread != null) {
             return;
         }
@@ -5948,10 +5728,11 @@ public class Channel implements Serializable {
                 final BlockEvent blockEvent;
                 try {
                     blockEvent = channelEventQue.getNextEvent();
-                } catch (EventingException e) {
+                } catch (EventHubException e) {
                     if (!shutdown) {
                         logger.error(e);
                     }
+
                     continue;
                 }
                 if (blockEvent == null) {
@@ -5960,11 +5741,12 @@ public class Channel implements Serializable {
                 }
 
                 try {
+
                     final String blockchainID = blockEvent.getChannelId();
                     final String from =
                             format("Channel %s eventqueue got block event with block number: %d for channel: %s, from %s",
                                     name, blockEvent.getBlockNumber(), blockchainID, blockEvent.getPeer() != null ? ("" + blockEvent.getPeer()) :
-                                            "");
+                                            ("" + blockEvent.getEventHub()));
 
                     logger.trace(from);
 
@@ -5981,18 +5763,7 @@ public class Channel implements Serializable {
                     for (BL l : blcopy) {
                         try {
                             logger.trace(format("Sending block event '%s' to block listener %s", from, l.handle));
-                            if (l.listener != null) {
-                                client.getExecutorService().execute(() -> l.listener.received(blockEvent));
-                            } else if (l.blockingQueue != null) {
-                                if (l.timeout < 0 || l.timeUnit == null) {
-                                    l.blockingQueue.put(new QueuedBlockEvent(l.handle, blockEvent));
-                                } else {
-                                    if (!l.blockingQueue.offer(new QueuedBlockEvent(l.handle, blockEvent), l.timeout, l.timeUnit)) {
-                                        logger.warn(format("Error calling block listener %s on channel: %s event: %s could not be added in time %d %s ",
-                                                l.handle, name, from, l.timeout, l.timeUnit));
-                                    }
-                                }
-                            }
+                            client.getExecutorService().execute(() -> l.listener.received(blockEvent));
                         } catch (Throwable e) { //Don't let one register stop rest.
                             logger.error(format("Error calling block listener %s on channel: %s event: %s ", l.handle, name, from), e);
                         }
@@ -6006,13 +5777,16 @@ public class Channel implements Serializable {
 
             logger.info(format("Channel %s eventThread shutting down. shutdown: %b  thread: %s ", name, shutdown, Thread.currentThread().getName()));
         });
+
     }
 
     /**
      * Own block listener to manage transactions.
+     * 自己的块侦听器来管理事务
      *
      * @return
      */
+
     private String registerTransactionListenerProcessor() throws InvalidArgumentException {
         logger.debug(format("Channel %s registerTransactionListenerProcessor starting", name));
 
@@ -6025,30 +5799,37 @@ public class Channel implements Serializable {
             }
 
             final String source = blockEvent.getPeer() != null ? blockEvent.getPeer().toString() :
-                    "not peer!";
+                    (blockEvent.getEventHub() != null ? blockEvent.getEventHub().toString() : "not peer or eventhub!");
 
             logger.debug(format("is peer %b, is filtered: %b", blockEvent.getPeer() != null, blockEvent.isFiltered()));
 
             final Iterable<TransactionEvent> transactionEvents = blockEvent.getTransactionEvents();
 
             if (transactionEvents == null || !transactionEvents.iterator().hasNext()) {
+
                 // no transactions today we can assume it was a config or update block.
+
                 if (isLaterBlock(blockEvent.getBlockNumber())) {
                     ServiceDiscovery lserviceDiscovery = serviceDiscovery;
                     if (null != lserviceDiscovery) {
 
                         client.getExecutorService().execute(() -> lserviceDiscovery.fullNetworkDiscovery(true));
                     }
+
                 } else {
+
                     lclient.getExecutorService().execute(() -> {
                         try {
                             if (!shutdown) {
                                 loadCACertificates(true);
                             }
+
                         } catch (Exception e) {
                             logger.warn(format("Channel %s failed to load certificates for an update", name), e);
                         }
+
                     });
+
                 }
 
                 return;
@@ -6059,6 +5840,7 @@ public class Channel implements Serializable {
             }
 
             for (TransactionEvent transactionEvent : blockEvent.getTransactionEvents()) {
+
                 logger.debug(format("Channel %s got event from %s for transaction %s in block number: %d", name,
                         source, transactionEvent.getTransactionID(), blockEvent.getBlockNumber()));
 
@@ -6080,6 +5862,7 @@ public class Channel implements Serializable {
                         if (l.eventReceived(transactionEvent)) {
                             l.fire(transactionEvent);
                         }
+
                     } catch (Throwable e) {
                         logger.error(e); // Don't let one register stop rest.
                     }
@@ -6099,11 +5882,13 @@ public class Channel implements Serializable {
     }
 
     void runSweeper() {
+
         if (shutdown || DELTA_SWEEP < 1) {
             return;
         }
 
         if (sweeper == null) {
+
             sweeperExecutorService = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = Executors.defaultThreadFactory().newThread(r);
                 t.setDaemon(true);
@@ -6111,10 +5896,16 @@ public class Channel implements Serializable {
             });
             sweeper = sweeperExecutorService.scheduleAtFixedRate(() -> {
                 try {
+
                     if (txListeners != null) {
+
                         synchronized (txListeners) {
-                            for (Iterator<Map.Entry<String, LinkedList<TL>>> it = txListeners.entrySet().iterator(); it.hasNext();) {
+
+                            for (Iterator<Map.Entry<String, LinkedList<TL>>> it = txListeners.entrySet().iterator(); it.hasNext();
+                            ) {
+
                                 Map.Entry<String, LinkedList<TL>> es = it.next();
+
                                 LinkedList<TL> tlLinkedList = es.getValue();
                                 tlLinkedList.removeIf(TL::sweepMe);
                                 if (tlLinkedList.isEmpty()) {
@@ -6126,37 +5917,50 @@ public class Channel implements Serializable {
                 } catch (Exception e) {
                     logger.warn("Sweeper got error:" + e.getMessage(), e);
                 }
+
             }, 0, DELTA_SWEEP, TimeUnit.MILLISECONDS);
         }
+
     }
 
     /**
      * Register a transactionId that to get notification on when the event is seen in the block chain.
+     * 注册一个transactionId，以获取有关何时在区块链中看到事件的通知。
      *
      * @param txid
      * @param nOfEvents
      * @return
      */
+
     private CompletableFuture<TransactionEvent> registerTxListener(String txid, NOfEvents nOfEvents, boolean failFast) {
+
         CompletableFuture<TransactionEvent> future = new CompletableFuture<>();
+
         new TL(txid, future, nOfEvents, failFast);
+
         return future;
+
     }
 
     /**
      * Unregister a transactionId
+     * 取消注册transactionId
      *
      * @param txid
      */
     private void unregisterTxListener(String txid) {
+
         synchronized (txListeners) {
+
             txListeners.remove(txid);
         }
+
     }
 
     /**
      * Register a chaincode event listener. Both chaincodeId pattern AND eventName pattern must match to invoke
      * the chaincodeEventListener
+     * 注册一个链码事件监听器。两个chaincodeId模式和eventName模式必须匹配才能调用chaincodeEventListener
      *
      * @param chaincodeId            Java pattern for chaincode identifier also know as chaincode name. If ma
      * @param eventName              Java pattern to match the event name.
@@ -6164,7 +5968,9 @@ public class Channel implements Serializable {
      * @return Handle to be used to unregister the event listener {@link #unregisterChaincodeEventListener(String)}
      * @throws InvalidArgumentException
      */
+
     public String registerChaincodeEventListener(Pattern chaincodeId, Pattern eventName, ChaincodeEventListener chaincodeEventListener) throws InvalidArgumentException {
+
         if (shutdown) {
             throw new InvalidArgumentException(format("Channel %s has been shutdown.", name));
         }
@@ -6188,15 +5994,18 @@ public class Channel implements Serializable {
             }
         }
         return chaincodeEventListenerEntry.handle;
+
     }
 
     /**
      * Unregister an existing chaincode event listener.
+     * 注销现有的chaincode事件侦听器。
      *
      * @param handle Chaincode event listener handle to be unregistered.
      * @return True if the chaincode handler was found and removed.
      * @throws InvalidArgumentException
      */
+
     public boolean unregisterChaincodeEventListener(String handle) throws InvalidArgumentException {
         boolean ret;
 
@@ -6208,16 +6017,19 @@ public class Channel implements Serializable {
 
         synchronized (chainCodeListeners) {
             ret = null != chainCodeListeners.remove(handle);
+
         }
 
         synchronized (this) {
             if (null != blh && chainCodeListeners.isEmpty()) {
+
                 unregisterBlockListener(blh);
                 blh = null;
             }
         }
 
         return ret;
+
     }
 
     ////////////////////////////////////////////////////////////////////////
@@ -6229,6 +6041,7 @@ public class Channel implements Serializable {
         // Chaincode event listener is internal Block listener for chaincode events.
 
         return registerBlockListener(blockEvent -> {
+
             if (chainCodeListeners.isEmpty()) {
                 return;
             }
@@ -6236,18 +6049,24 @@ public class Channel implements Serializable {
             LinkedList<ChaincodeEvent> chaincodeEvents = new LinkedList<>();
 
             //Find the chaincode events in the transactions.
+
             for (TransactionEvent transactionEvent : blockEvent.getTransactionEvents()) {
+
                 logger.debug(format("Channel %s got event for transaction %s ", name, transactionEvent.getTransactionID()));
 
                 for (BlockInfo.TransactionEnvelopeInfo.TransactionActionInfo info : transactionEvent.getTransactionActionInfos()) {
+
                     ChaincodeEvent event = info.getEvent();
                     if (null != event) {
                         chaincodeEvents.add(event);
                     }
+
                 }
+
             }
 
             if (!chaincodeEvents.isEmpty()) {
+
                 class MatchPair {
                     final ChaincodeEventListenerEntry eventListener;
                     final ChaincodeEvent event;
@@ -6261,31 +6080,44 @@ public class Channel implements Serializable {
                 List<MatchPair> matches = new LinkedList<>(); //Find matches.
 
                 synchronized (chainCodeListeners) {
+
                     for (ChaincodeEventListenerEntry chaincodeEventListenerEntry : chainCodeListeners.values()) {
+
                         for (ChaincodeEvent chaincodeEvent : chaincodeEvents) {
+
                             if (chaincodeEventListenerEntry.isMatch(chaincodeEvent)) {
+
                                 matches.add(new MatchPair(chaincodeEventListenerEntry, chaincodeEvent));
                             }
+
                         }
+
                     }
                 }
 
                 //fire events
                 for (MatchPair match : matches) {
+
                     ChaincodeEventListenerEntry chaincodeEventListenerEntry = match.eventListener;
                     ChaincodeEvent ce = match.event;
                     chaincodeEventListenerEntry.fire(blockEvent, ce);
+
                 }
+
             }
+
         });
     }
 
     /**
      * Shutdown the channel with all resources released.
+     * 关闭释放所有资源的通道
      *
      * @param force force immediate shutdown.
      */
+
     public synchronized void shutdown(boolean force) {
+
         if (shutdown) {
             return;
         }
@@ -6293,6 +6125,7 @@ public class Channel implements Serializable {
         String ltransactionListenerProcessorHandle = transactionListenerProcessorHandle;
         transactionListenerProcessorHandle = null;
         if (null != ltransactionListenerProcessorHandle) {
+
             try {
                 unregisterBlockListener(ltransactionListenerProcessorHandle);
             } catch (Exception e) {
@@ -6303,6 +6136,7 @@ public class Channel implements Serializable {
         String lchaincodeEventUpgradeListenerHandle = chaincodeEventUpgradeListenerHandle;
         chaincodeEventUpgradeListenerHandle = null;
         if (null != lchaincodeEventUpgradeListenerHandle) {
+
             try {
                 unregisterChaincodeEventListener(lchaincodeEventUpgradeListenerHandle);
             } catch (Exception e) {
@@ -6321,6 +6155,7 @@ public class Channel implements Serializable {
 
         if (chainCodeListeners != null) {
             chainCodeListeners.clear();
+
         }
 
         if (blockListeners != null) {
@@ -6333,7 +6168,18 @@ public class Channel implements Serializable {
 
         client = null;
 
+        for (EventHub eh : eventHubs) {
+
+            try {
+                eh.shutdown();
+            } catch (Exception e) {
+                // Best effort.
+            }
+
+        }
+        eventHubs.clear();
         for (Peer peer : new ArrayList<>(getPeers())) {
+
             try {
                 removePeerInternal(peer);
                 peer.shutdown(force);
@@ -6380,29 +6226,37 @@ public class Channel implements Serializable {
 
     /**
      * Serialize channel to a file using Java serialization.
+     * 使用Java序列化将通道序列化到文件。
      * Deserialized channel will NOT be in an initialized state.
+     * 反序列化的通道将不会处于初始化状态
      *
      * @param file file
      * @throws IOException
      * @throws InvalidArgumentException
      */
+
     public void serializeChannel(File file) throws IOException, InvalidArgumentException {
+
         if (null == file) {
             throw new InvalidArgumentException("File parameter may not be null");
         }
 
         Files.write(Paths.get(file.getAbsolutePath()), serializeChannel(),
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+
     }
 
     /**
      * Serialize channel to a byte array using Java serialization.
+     * 使用Java序列化将通道序列化为字节数组。
      * Deserialized channel will NOT be in an initialized state.
+     * 反序列化的通道将不会处于初始化状态
      *
      * @throws InvalidArgumentException
      * @throws IOException
      */
     public byte[] serializeChannel() throws IOException, InvalidArgumentException {
+
         if (isShutdown()) {
             throw new InvalidArgumentException(format("Channel %s has been shutdown.", getName()));
         }
@@ -6424,20 +6278,21 @@ public class Channel implements Serializable {
                 }
             }
         }
+
     }
 
     @Override
     protected void finalize() throws Throwable {
-        try {
-            shutdown(true);
-        } finally {
-            super.finalize();
-        }
+        shutdown(true);
+        super.finalize();
+
     }
 
     /**
      * Options for the peer.
+     * 对等方的选项
      * These options are channel based.
+     * 这些选项基于通道
      */
     public static class PeerOptions implements Cloneable, Serializable {
         private static final long serialVersionUID = -6906605662806520793L;
@@ -6454,9 +6309,11 @@ public class Channel implements Serializable {
             sb.append("PeerOptions( " + format("newest: %s, startEvents: %s, stopEvents: %s, registerEventsForFilteredBlocks: %s", "" + newest, "" + startEvents, "" + stopEvents, registerEventsForFilteredBlocks));
 
             if (peerRoles != null && !peerRoles.isEmpty()) {
+
                 sb.append(", PeerRoles:[");
 
                 String sep = "";
+
                 for (PeerRole peerRole : peerRoles) {
                     sb.append(sep).append(peerRole.getPropertyName());
                     sep = " ,";
@@ -6469,6 +6326,7 @@ public class Channel implements Serializable {
 
         /**
          * Is the peer eventing service registered for filtered blocks
+         * 对等事件服务是否已注册过滤块
          *
          * @return true if filtered blocks will be returned by the peer eventing service.
          */
@@ -6478,9 +6336,11 @@ public class Channel implements Serializable {
 
         /**
          * Register the peer eventing services to return filtered blocks.
+         * 注册对等事件服务以返回已过滤的块
          *
          * @return the PeerOptions instance.
          */
+
         public PeerOptions registerEventsForFilteredBlocks() {
             registerEventsForFilteredBlocks = true;
             return this;
@@ -6488,9 +6348,11 @@ public class Channel implements Serializable {
 
         /**
          * Register the peer eventing services to return full event blocks.
+         * 注册对等事件服务以返回完整的事件块
          *
          * @return the PeerOptions instance.
          */
+
         public PeerOptions registerEventsForBlocks() {
             registerEventsForFilteredBlocks = false;
             return this;
@@ -6498,6 +6360,7 @@ public class Channel implements Serializable {
 
         /**
          * Get newest block on startup of peer eventing service.
+         * 在启动对等事件服务时获得最新的阻止
          *
          * @return
          */
@@ -6507,6 +6370,7 @@ public class Channel implements Serializable {
 
         /**
          * The block number to start getting events from on start up of the peer eventing service..
+         * 从对等事件服务启动时开始获取事件的块号
          *
          * @return the start number
          */
@@ -6516,29 +6380,37 @@ public class Channel implements Serializable {
 
         /**
          * The stopping block number when the peer eventing service will stop sending blocks.
+         * 对等事件服务将停止发送块时的停止块号
          *
          * @return the stop block number.
          */
+
         public Long getStopEvents() {
             return stopEvents;
         }
 
-        protected PeerOptions() { }
+        protected PeerOptions() {
+
+        }
 
         /**
          * Create an instance of PeerOptions.
+         * 创建PeerOptions的实例。
          *
          * @return the PeerOptions instance.
          */
+
         public static PeerOptions createPeerOptions() {
             return new PeerOptions();
         }
 
         /**
          * Return the roles the peer has.
+         * 返回对等方具有的角色
          *
          * @return the roles {@link PeerRole}
          */
+
         public EnumSet<PeerRole> getPeerRoles() {
             if (peerRoles == null) {
                 peerRoles = EnumSet.complementOf(EnumSet.of(PeerRole.SERVICE_DISCOVERY));
@@ -6548,10 +6420,12 @@ public class Channel implements Serializable {
 
         /**
          * Set the roles this peer will have on the chain it will added or joined.
+         * 设置此对等方在要添加或加入的链上将具有的角色
          *
          * @param peerRoles {@link PeerRole}
          * @return This PeerOptions.
          */
+
         public PeerOptions setPeerRoles(EnumSet<PeerRole> peerRoles) {
             this.peerRoles = peerRoles;
             return this;
@@ -6559,11 +6433,14 @@ public class Channel implements Serializable {
 
         /**
          * Add to the roles this peer will have on the chain it will added or joined.
+         * 添加此对等方将添加或加入的链中的角色
          *
          * @param peerRole see {@link PeerRole}
          * @return This PeerOptions.
          */
+
         public PeerOptions addPeerRole(PeerRole peerRole) {
+
             if (peerRoles == null) {
                 peerRoles = EnumSet.noneOf(PeerRole.class);
 
@@ -6574,6 +6451,7 @@ public class Channel implements Serializable {
 
         /**
          * Set the block number the eventing peer will start relieving events.
+         * 设置事件对等方将开始缓解事件的块号
          *
          * @param start The staring block number.
          * @return This PeerOptions.
@@ -6588,9 +6466,11 @@ public class Channel implements Serializable {
         /**
          * This is the default. It will start retrieving events with the newest. Note this is not the
          * next block that is added to the chain  but the current block on the chain.
+         * 这是默认值。它将开始检索最新的事件。注意，这不是添加到链中的下一个块，而是链中的当前块
          *
          * @return This PeerOptions.
          */
+
         public PeerOptions startEventsNewest() {
             startEvents = null;
             newest = true;
@@ -6600,6 +6480,7 @@ public class Channel implements Serializable {
 
         /**
          * The block number to stop sending events.
+         * 停止发送事件的块号
          *
          * @param stop the number to stop sending events.
          * @return This PeerOptions.
@@ -6614,45 +6495,54 @@ public class Channel implements Serializable {
          *
          * @return return a duplicate of this instance.
          */
+
         public PeerOptions clone() {
             try {
                 return (PeerOptions) super.clone();
             } catch (CloneNotSupportedException e) {
                 throw new RuntimeException(e);
             }
+
         }
+
     }
 
     /**
      * MSPs
      */
+
     class MSP {
         final String orgName;
-        final MspConfigPackage.FabricMSPConfig fabricMSPConfig;
+        final MspConfig.FabricMSPConfig fabricMSPConfig;
         byte[][] adminCerts;
         byte[][] rootCerts;
         byte[][] intermediateCerts;
 
-        MSP(String orgName, MspConfigPackage.FabricMSPConfig fabricMSPConfig) {
+        MSP(String orgName, MspConfig.FabricMSPConfig fabricMSPConfig) {
             this.orgName = orgName;
             this.fabricMSPConfig = fabricMSPConfig;
         }
 
         /**
          * Known as the MSPID internally
+         * 内部称为MSPID
          *
          * @return
          */
+
         String getID() {
             return fabricMSPConfig.getName();
+
         }
 
         /**
          * AdminCerts
+         * 管理员证书
          *
          * @return array of admin certs in PEM bytes format.
          */
         byte[][] getAdminCerts() {
+
             if (null == adminCerts) {
                 adminCerts = new byte[fabricMSPConfig.getAdminsList().size()][];
                 int i = 0;
@@ -6665,10 +6555,12 @@ public class Channel implements Serializable {
 
         /**
          * RootCerts
+         * 根证书
          *
          * @return array of admin certs in PEM bytes format.
          */
         byte[][] getRootCerts() {
+
             if (null == rootCerts) {
                 rootCerts = new byte[fabricMSPConfig.getRootCertsList().size()][];
                 int i = 0;
@@ -6682,10 +6574,12 @@ public class Channel implements Serializable {
 
         /**
          * IntermediateCerts
+         * 中级证书
          *
          * @return array of intermediate certs in PEM bytes format.
          */
         byte[][] getIntermediateCerts() {
+
             if (null == intermediateCerts) {
                 intermediateCerts = new byte[fabricMSPConfig.getIntermediateCertsList().size()][];
                 int i = 0;
@@ -6695,9 +6589,11 @@ public class Channel implements Serializable {
             }
             return intermediateCerts;
         }
+
     }
 
     class ChannelEventQue {
+
         private final BlockingQueue<BlockEvent> events = new LinkedBlockingQueue<>(); //Thread safe
         private Throwable eventException;
 
@@ -6709,29 +6605,40 @@ public class Channel implements Serializable {
             if (shutdown) {
                 return false;
             }
+
+            //For now just support blocks --- other types are also reported as blocks.
+
+            if (!event.isBlockEvent()) {
+                return false;
+            }
+
             // May be fed by multiple eventhubs but BlockingQueue.add() is thread-safe
             events.add(event);
 
             return true;
+
         }
 
-        BlockEvent getNextEvent() throws EventingException {
+        BlockEvent getNextEvent() throws EventHubException {
             if (shutdown) {
-                throw new EventingException(format("Channel %s has been shutdown", name));
+                throw new EventHubException(format("Channel %s has been shutdown", name));
+
             }
             BlockEvent ret = null;
             if (eventException != null) {
-                throw new EventingException(eventException);
+                throw new EventHubException(eventException);
             }
             try {
                 ret = events.take();
             } catch (InterruptedException e) {
                 if (shutdown) {
-                    throw new EventingException(format("channel %s is shutdown", name), e);
+                    throw new EventHubException(format("channel %s is shutdown", name), e);
+
                 } else {
                     logger.warn(e);
                     if (eventException != null) {
-                        EventingException eve = new EventingException(e);
+
+                        EventHubException eve = new EventHubException(e);
                         logger.error(eve.getMessage(), eve);
                         throw eve;
                     }
@@ -6739,45 +6646,37 @@ public class Channel implements Serializable {
             }
 
             if (eventException != null) {
-                throw new EventingException(eventException);
+                throw new EventHubException(eventException);
             }
 
             if (shutdown) {
-                throw new EventingException(format("Channel %s has been shutdown.", name));
+
+                throw new EventHubException(format("Channel %s has been shutdown.", name));
+
             }
 
             return ret;
         }
+
     }
 
     class BL {
+
         final BlockListener listener;
         final String handle;
-        private final BlockingQueue<QueuedBlockEvent> blockingQueue;
-        private final long timeout;
-        private final TimeUnit timeUnit;
 
-        {
+        BL(BlockListener listener) {
+
             handle = BLOCK_LISTENER_TAG + Utils.generateUUID() + BLOCK_LISTENER_TAG;
             logger.debug(format("Channel %s blockListener %s starting", name, handle));
 
-            synchronized (blockListeners) {
-                blockListeners.put(handle, this);
-            }
-        }
-
-        BL(BlockListener listener) {
             this.listener = listener;
-            blockingQueue = null;
-            timeout = Long.MAX_VALUE;
-            timeUnit = null;
-        }
+            synchronized (blockListeners) {
 
-        BL(BlockingQueue<QueuedBlockEvent> blockingQueue, long timeout, TimeUnit timeUnit) {
-            this.blockingQueue = blockingQueue;
-            this.timeout = timeout;
-            this.timeUnit = timeUnit;
-            listener = null;
+                blockListeners.put(handle, this);
+
+            }
+
         }
 
         public String getHandle() {
@@ -6792,7 +6691,7 @@ public class Channel implements Serializable {
         final CompletableFuture<TransactionEvent> future;
         final boolean failFast;
         final Set<Peer> peers;
-
+        final Set<EventHub> eventHubs;
         private final NOfEvents nOfEvents;
         long sweepTime = System.currentTimeMillis() + (long) (DELTA_SWEEP * 1.5);
 
@@ -6801,13 +6700,14 @@ public class Channel implements Serializable {
             this.future = future;
             this.nOfEvents = new NOfEvents(nOfEvents);
             peers = new HashSet<>(nOfEvents.unSeenPeers());
-
+            eventHubs = new HashSet<>(nOfEvents.unSeenEventHubs());
             this.failFast = failFast;
             addListener();
         }
 
         /**
          * Record transactions event.
+         * 记录交易事件
          *
          * @param transactionEvent
          * @return True if transactions have been seen on all eventing peers and eventhubs.
@@ -6816,8 +6716,12 @@ public class Channel implements Serializable {
             sweepTime = System.currentTimeMillis() + DELTA_SWEEP; //seen activity keep it active.
 
             final Peer peer = transactionEvent.getPeer();
+            final EventHub eventHub = transactionEvent.getEventHub();
 
             if (peer != null && !peers.contains(peer)) {
+                return false;
+            }
+            if (eventHub != null && !eventHubs.contains(eventHub)) {
                 return false;
             }
 
@@ -6828,6 +6732,11 @@ public class Channel implements Serializable {
             if (peer != null) {
                 nOfEvents.seen(peer);
                 logger.debug(format("Channel %s seen transaction event %s for peer %s", name, txID, peer.toString()));
+            } else if (null != eventHub) {
+                logger.debug(format("Channel %s seen transaction event %s for eventHub %s", name, txID, eventHub.toString()));
+                nOfEvents.seen(eventHub);
+            } else {
+                logger.error(format("Channel %s seen transaction event %s with no associated peer or eventhub", name, txID));
             }
 
             boolean isEmpty;
@@ -6846,12 +6755,26 @@ public class Channel implements Serializable {
         }
 
         boolean sweepMe() { // Sweeps DO NOT fire future. user needs to put timeout on their futures for timeouts.
+
             final boolean ret = sweepTime < System.currentTimeMillis() || fired.get() || future.isDone();
 
             if (IS_WARN_LEVEL && ret) {
-                StringBuilder sb = new StringBuilder(10000);
 
-                String sep = "Non reporting peers: ";
+                StringBuilder sb = new StringBuilder(10000);
+                sb.append("Non reporting event hubs:");
+                String sep = "";
+                for (EventHub eh : nOfEvents.unSeenEventHubs()) {
+                    sb.append(sep).append(eh.toString())
+                            .append(" status: ")
+                            .append(eh.getStatus());
+                    sep = ", ";
+
+                }
+                if (sb.length() != 0) {
+                    sb.append(". ");
+
+                }
+                sep = " Non reporting peers: ";
                 for (Peer peer : nOfEvents.unSeenPeers()) {
                     sb.append(sep).append(peer.toString()).append(" status:")
                             .append(peer.getEventingStatus());
@@ -6865,9 +6788,11 @@ public class Channel implements Serializable {
             }
 
             return ret;
+
         }
 
-        void fire(BlockEvent.TransactionEvent transactionEvent) {
+        void fire(TransactionEvent transactionEvent) {
+
             if (fired.getAndSet(true)) {
                 return;
             }
@@ -6900,9 +6825,11 @@ public class Channel implements Serializable {
                                 transactionEvent)));
             }
         }
+
     }
 
     private class ChaincodeEventListenerEntry {
+
         private final Pattern chaincodeIdPattern;
         private final Pattern eventNamePattern;
         private final ChaincodeEventListener chaincodeEventListener;
@@ -6915,16 +6842,23 @@ public class Channel implements Serializable {
             this.handle = CHAINCODE_EVENTS_TAG + Utils.generateUUID() + CHAINCODE_EVENTS_TAG;
 
             synchronized (chainCodeListeners) {
+
                 chainCodeListeners.put(handle, this);
+
             }
         }
 
         boolean isMatch(ChaincodeEvent chaincodeEvent) {
+
             return chaincodeIdPattern.matcher(chaincodeEvent.getChaincodeId()).matches() && eventNamePattern.matcher(chaincodeEvent.getEventName()).matches();
+
         }
 
         void fire(BlockEvent blockEvent, ChaincodeEvent ce) {
+
             client.getExecutorService().execute(() -> chaincodeEventListener.received(handle, blockEvent, ce));
+
         }
     }
+
 }
